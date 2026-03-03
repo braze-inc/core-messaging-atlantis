@@ -1,17 +1,20 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package metrics
 
 import (
+	"fmt"
 	"io"
 	"strings"
 	"time"
 
-	"github.com/cactus/go-statsd-client/statsd"
-	"github.com/pkg/errors"
+	"github.com/cactus/go-statsd-client/v5/statsd"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/logging"
-	"github.com/uber-go/tally"
-	tallyprom "github.com/uber-go/tally/prometheus"
-	tallystatsd "github.com/uber-go/tally/statsd"
+	tally "github.com/uber-go/tally/v4"
+	tallyprom "github.com/uber-go/tally/v4/prometheus"
+	tallystatsd "github.com/uber-go/tally/v4/statsd"
 )
 
 func NewLoggingScope(logger logging.SimpleLogging, statsNamespace string) (tally.Scope, io.Closer, error) {
@@ -23,11 +26,12 @@ func NewScope(cfg valid.Metrics, logger logging.SimpleLogging, statsNamespace st
 	reporter, err := newReporter(cfg, logger)
 
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "initializing stats reporter")
+		return nil, nil, nil, fmt.Errorf("initializing stats reporter: %w", err)
 	}
 
 	scopeOpts := tally.ScopeOptions{
-		Prefix: statsNamespace,
+		Prefix:          statsNamespace,
+		SanitizeOptions: &tallyprom.DefaultSanitizerOpts,
 	}
 
 	if r, ok := reporter.(tally.StatsReporter); ok {
@@ -45,7 +49,7 @@ func newReporter(cfg valid.Metrics, logger logging.SimpleLogging) (tally.BaseSta
 
 	// return statsd metrics if configured
 	if cfg.Statsd != nil {
-		return newStatsReporter(cfg, logger)
+		return newStatsReporter(cfg)
 	}
 
 	// return prometheus metrics if configured
@@ -58,7 +62,7 @@ func newReporter(cfg valid.Metrics, logger logging.SimpleLogging) (tally.BaseSta
 
 }
 
-func newStatsReporter(cfg valid.Metrics, logger logging.SimpleLogging) (tally.StatsReporter, error) {
+func newStatsReporter(cfg valid.Metrics) (tally.StatsReporter, error) {
 
 	statsdCfg := cfg.Statsd
 
@@ -67,7 +71,7 @@ func newStatsReporter(cfg valid.Metrics, logger logging.SimpleLogging) (tally.St
 	})
 
 	if err != nil {
-		return nil, errors.Wrap(err, "initializing statsd client")
+		return nil, fmt.Errorf("initializing statsd client: %w", err)
 	}
 
 	return tallystatsd.NewReporter(client, tallystatsd.Options{}), nil

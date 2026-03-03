@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package websocket
 
 import (
@@ -5,7 +8,6 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
-	"github.com/pkg/errors"
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
@@ -31,9 +33,19 @@ type Multiplexor struct {
 	registry     PartitionRegistry
 }
 
-func NewMultiplexor(log logging.SimpleLogging, keyGenerator PartitionKeyGenerator, registry PartitionRegistry) *Multiplexor {
-	upgrader := websocket.Upgrader{}
-	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+func checkOriginFunc(checkOrigin bool) func(r *http.Request) bool {
+	if checkOrigin {
+		return nil // use Gorilla websocket's checkSameOrigin
+	}
+	return func(r *http.Request) bool {
+		return true
+	}
+}
+
+func NewMultiplexor(log logging.SimpleLogging, keyGenerator PartitionKeyGenerator, registry PartitionRegistry, checkOrigin bool) *Multiplexor {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: checkOriginFunc(checkOrigin),
+	}
 	return &Multiplexor{
 		writer: &Writer{
 			upgrader: upgrader,
@@ -50,7 +62,7 @@ func (m *Multiplexor) Handle(w http.ResponseWriter, r *http.Request) error {
 	key, err := m.keyGenerator.Generate(r)
 
 	if err != nil {
-		return errors.Wrapf(err, "generating partition key")
+		return fmt.Errorf("generating partition key: %w", err)
 	}
 
 	// check if the job ID exists before registering receiver
@@ -66,5 +78,9 @@ func (m *Multiplexor) Handle(w http.ResponseWriter, r *http.Request) error {
 	go m.registry.Register(key, buffer)
 	defer m.registry.Deregister(key, buffer)
 
-	return errors.Wrapf(m.writer.Write(w, r, buffer), "writing to ws %s", key)
+	err = m.writer.Write(w, r, buffer)
+	if err != nil {
+		return fmt.Errorf("writing to ws %s: %w", key, err)
+	}
+	return nil
 }

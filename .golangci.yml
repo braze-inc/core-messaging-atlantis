@@ -1,21 +1,38 @@
+version: "2"
 linters:
   enable:
-  - deadcode
-  - errcheck
-  - gochecknoinits
-# We don't use goconst because it gives false positives in the tests.
-#  - goconst
-  - gofmt
-  - revive
-  - gosec
-  - gosimple
-  - ineffassign
-  - interfacer
-  - staticcheck
-  - structcheck
-  - typecheck
-  - unconvert
-  - unused
-  - varcheck
-  - vet
-  - vetshadow
+    - modernize
+    - gochecknoinits
+    - gosec
+    - misspell
+    - revive
+    - testifylint
+    - unconvert
+  settings:
+    misspell:
+      ignore-rules:
+        - noteable
+    revive:
+      rules:
+        - name: dot-imports
+          disabled: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

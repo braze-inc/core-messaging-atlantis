@@ -3,48 +3,49 @@ name: release
 on:
   push:
     tags:
-      - v*.*.* # stable release like, v0.19.2
-      - v*.*.*-pre.* # pre release like, v0.19.0-pre.calendardate
+      - v*.*.*
+  workflow_dispatch:
+
+permissions:
+  contents: write  # for goreleaser to create releases and upload release assets
 
 jobs:
   goreleaser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+    - name: Harden Runner
+      uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+      with:
+        egress-policy: audit
+
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       with:
         submodules: true
-    - name: Set up Go
-      uses: actions/setup-go@v3
+
+    - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
       with:
-        go-version: 1.17
+        go-version-file: go.mod
 
     - name: Run GoReleaser for stable release
-      uses: goreleaser/goreleaser-action@v3
-      if: (!contains(github.ref, '-pre.'))
+      uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7
+      if: (!contains(github.ref, 'pre'))
       with:
-        version: v0.183.0
-        args: release --rm-dist
+        # You can pass flags to goreleaser via GORELEASER_ARGS
+        # --clean will save you deleting the dist dir
+        args: release --clean
+        distribution: goreleaser # or 'goreleaser-pro'
+        version: "~> v2" # or 'latest', 'nightly', semver
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Generate changelog for pre release
-      if: contains(github.ref, '-pre.')
+      if: contains(github.ref, 'pre')
       id: changelog
       run: |
-        echo "::set-output name=RELEASE_TAG::${GITHUB_REF#refs/tags/}"
+        echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
         gh api repos/$GITHUB_REPOSITORY/releases/generate-notes \
           -f tag_name="${GITHUB_REF#refs/tags/}" \
-          -f target_commitish=master \
+          -f target_commitish=main \
           -q .body > tmp-CHANGELOG.md
       env:
-        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-    - name: Run GoReleaser for pre-release
-      uses: goreleaser/goreleaser-action@v3
-      if: contains(github.ref, '-pre.')
-      with:
-        version: v0.183.0
-        args: release --rm-dist --release-notes=tmp-CHANGELOG.md
-      env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GORELEASER_CURRENT_TAG: ${{ steps.changelog.outputs.RELEASE_TAG }}

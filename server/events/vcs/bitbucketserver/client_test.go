@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package bitbucketserver_test
 
 import (
@@ -13,6 +16,7 @@ import (
 
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketserver"
+	"github.com/runatlantis/atlantis/server/logging"
 	. "github.com/runatlantis/atlantis/testing"
 )
 
@@ -72,6 +76,7 @@ func TestClient_BasePath(t *testing.T) {
 
 // Should follow pagination properly.
 func TestClient_GetModifiedFilesPagination(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
 	respTemplate := `
 {
   "values": [
@@ -101,8 +106,8 @@ func TestClient_GetModifiedFilesPagination(t *testing.T) {
 		switch r.RequestURI {
 		// The first request should hit this URL.
 		case "/rest/api/1.0/projects/ow/repos/repo/pull-requests/1/changes?start=0":
-			resp := strings.Replace(firstResp, `"isLastPage": true`, `"isLastPage": false`, -1)
-			resp = strings.Replace(resp, `"nextPageStart": null`, `"nextPageStart": 3`, -1)
+			resp := strings.ReplaceAll(firstResp, `"isLastPage": true`, `"isLastPage": false`)
+			resp = strings.ReplaceAll(resp, `"nextPageStart": null`, `"nextPageStart": 3`)
 			w.Write([]byte(resp)) // nolint: errcheck
 			return
 			// The second should hit this URL.
@@ -120,18 +125,20 @@ func TestClient_GetModifiedFilesPagination(t *testing.T) {
 	client, err := bitbucketserver.NewClient(http.DefaultClient, "user", "pass", serverURL, "runatlantis.io")
 	Ok(t, err)
 
-	files, err := client.GetModifiedFiles(models.Repo{
-		FullName:          "owner/repo",
-		Owner:             "owner",
-		Name:              "repo",
-		SanitizedCloneURL: fmt.Sprintf("%s/scm/ow/repo.git", serverURL),
-		VCSHost: models.VCSHost{
-			Type:     models.BitbucketCloud,
-			Hostname: "bitbucket.org",
-		},
-	}, models.PullRequest{
-		Num: 1,
-	})
+	files, err := client.GetModifiedFiles(
+		logger,
+		models.Repo{
+			FullName:          "owner/repo",
+			Owner:             "owner",
+			Name:              "repo",
+			SanitizedCloneURL: fmt.Sprintf("%s/scm/ow/repo.git", serverURL),
+			VCSHost: models.VCSHost{
+				Type:     models.BitbucketCloud,
+				Hostname: "bitbucket.org",
+			},
+		}, models.PullRequest{
+			Num: 1,
+		})
 	Ok(t, err)
 	Equals(t, []string{"file1.txt", "file2.txt", "file3.txt"}, files)
 }
@@ -139,6 +146,7 @@ func TestClient_GetModifiedFilesPagination(t *testing.T) {
 // Test that we use the correct version parameter in our call to merge the pull
 // request.
 func TestClient_MergePull(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
 	pullRequest, err := os.ReadFile(filepath.Join("testdata", "pull-request.json"))
 	Ok(t, err)
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -161,33 +169,36 @@ func TestClient_MergePull(t *testing.T) {
 	client, err := bitbucketserver.NewClient(http.DefaultClient, "user", "pass", testServer.URL, "runatlantis.io")
 	Ok(t, err)
 
-	err = client.MergePull(models.PullRequest{
-		Num:        1,
-		HeadCommit: "",
-		URL:        "",
-		HeadBranch: "",
-		BaseBranch: "",
-		Author:     "",
-		State:      0,
-		BaseRepo: models.Repo{
-			FullName:          "owner/repo",
-			Owner:             "owner",
-			Name:              "repo",
-			SanitizedCloneURL: fmt.Sprintf("%s/scm/ow/repo.git", testServer.URL),
-			VCSHost: models.VCSHost{
-				Type:     models.BitbucketCloud,
-				Hostname: "bitbucket.org",
+	err = client.MergePull(
+		logger,
+		models.PullRequest{
+			Num:        1,
+			HeadCommit: "",
+			URL:        "",
+			HeadBranch: "",
+			BaseBranch: "",
+			Author:     "",
+			State:      0,
+			BaseRepo: models.Repo{
+				FullName:          "owner/repo",
+				Owner:             "owner",
+				Name:              "repo",
+				SanitizedCloneURL: fmt.Sprintf("%s/scm/ow/repo.git", testServer.URL),
+				VCSHost: models.VCSHost{
+					Type:     models.BitbucketCloud,
+					Hostname: "bitbucket.org",
+				},
 			},
-		},
-	}, models.PullRequestOptions{
-		DeleteSourceBranchOnMerge: false,
-	})
+		}, models.PullRequestOptions{
+			DeleteSourceBranchOnMerge: false,
+		})
 	Ok(t, err)
 }
 
 // Test that we delete the source branch in our call to merge the pull
 // request.
 func TestClient_MergePullDeleteSourceBranch(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
 	pullRequest, err := os.ReadFile(filepath.Join("testdata", "pull-request.json"))
 	Ok(t, err)
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -220,27 +231,31 @@ func TestClient_MergePullDeleteSourceBranch(t *testing.T) {
 	client, err := bitbucketserver.NewClient(http.DefaultClient, "user", "pass", testServer.URL, "runatlantis.io")
 	Ok(t, err)
 
-	err = client.MergePull(models.PullRequest{
-		Num:        1,
-		HeadCommit: "",
-		URL:        "",
-		HeadBranch: "foo",
-		BaseBranch: "",
-		Author:     "",
-		State:      0,
-		BaseRepo: models.Repo{
-			FullName:          "owner/repo",
-			Owner:             "owner",
-			Name:              "repo",
-			SanitizedCloneURL: fmt.Sprintf("%s/scm/ow/repo.git", testServer.URL),
-			VCSHost: models.VCSHost{
-				Type:     models.BitbucketServer,
-				Hostname: "bitbucket.org",
+	err = client.MergePull(
+		logger,
+		models.PullRequest{
+			Num:        1,
+			HeadCommit: "",
+			URL:        "",
+			HeadBranch: "foo",
+			BaseBranch: "",
+			Author:     "",
+			State:      0,
+			BaseRepo: models.Repo{
+				FullName:          "owner/repo",
+				Owner:             "owner",
+				Name:              "repo",
+				SanitizedCloneURL: fmt.Sprintf("%s/scm/ow/repo.git", testServer.URL),
+				VCSHost: models.VCSHost{
+					Type:     models.BitbucketServer,
+					Hostname: "bitbucket.org",
+				},
 			},
 		},
-	}, models.PullRequestOptions{
-		DeleteSourceBranchOnMerge: true,
-	})
+		models.PullRequestOptions{
+			DeleteSourceBranchOnMerge: true,
+		},
+	)
 	Ok(t, err)
 }
 

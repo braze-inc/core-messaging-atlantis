@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package server_test
 
 import (
@@ -11,7 +14,7 @@ import (
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	. "github.com/runatlantis/atlantis/testing"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRouter_GenerateLockURL(t *testing.T) {
@@ -107,6 +110,6 @@ func TestGenerateProjectJobURL_ShouldReturnErrorWhenJobIDNotSpecified(t *testing
 	}
 	expectedErrString := "no job id in ctx"
 	gotURL, err := router.GenerateProjectJobURL(ctx)
-	assert.EqualError(t, err, expectedErrString)
+	require.EqualError(t, err, expectedErrString)
 	Equals(t, "", gotURL)
 }

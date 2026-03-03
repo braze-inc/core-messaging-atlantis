@@ -1,16 +1,18 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events
 
 import (
 	"path/filepath"
-	"regexp"
+	"strings"
 
 	"github.com/google/uuid"
-	"github.com/hashicorp/go-version"
-	"github.com/hashicorp/terraform-config-inspect/tfconfig"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
-	"github.com/uber-go/tally"
+	tally "github.com/uber-go/tally/v4"
 )
 
 func NewProjectCommandContextBuilder(policyCheckEnabled bool, commentBuilder CommentBuilder, scope tally.Scope) ProjectCommandContextBuilder {
@@ -36,10 +38,11 @@ type ProjectCommandContextBuilder interface {
 	BuildProjectContext(
 		ctx *command.Context,
 		cmdName command.Name,
+		subCmdName string,
 		prjCfg valid.MergedProjectCfg,
 		commentFlags []string,
 		repoDir string,
-		automerge, deleteSourceBranchOnMerge, parallelApply, parallelPlan, verbose bool,
+		automerge, parallelApply, parallelPlan, verbose, abortOnExecutionOrderFail bool, terraformClient tfclient.Client,
 	) []command.ProjectContext
 }
 
@@ -47,7 +50,7 @@ type ProjectCommandContextBuilder interface {
 // object relevant to the command it applies to.
 type CommandScopedStatsProjectCommandContextBuilder struct {
 	ProjectCommandContextBuilder
-	// Conciously making this global since it gets flushed periodically anyways
+	// Consciously making this global since it gets flushed periodically anyways
 	ProjectCounter tally.Counter
 }
 
@@ -55,15 +58,17 @@ type CommandScopedStatsProjectCommandContextBuilder struct {
 func (cb *CommandScopedStatsProjectCommandContextBuilder) BuildProjectContext(
 	ctx *command.Context,
 	cmdName command.Name,
+	subCmdName string,
 	prjCfg valid.MergedProjectCfg,
 	commentFlags []string,
 	repoDir string,
-	automerge, deleteSourceBranchOnMerge, parallelApply, parallelPlan, verbose bool,
+	automerge, parallelApply, parallelPlan, verbose, abortOnExecutionOrderFail bool,
+	terraformClient tfclient.Client,
 ) (projectCmds []command.ProjectContext) {
 	cb.ProjectCounter.Inc(1)
 
 	cmds := cb.ProjectCommandContextBuilder.BuildProjectContext(
-		ctx, cmdName, prjCfg, commentFlags, repoDir, automerge, deleteSourceBranchOnMerge, parallelApply, parallelPlan, verbose,
+		ctx, cmdName, subCmdName, prjCfg, commentFlags, repoDir, automerge, parallelApply, parallelPlan, verbose, abortOnExecutionOrderFail, terraformClient,
 	)
 
 	projectCmds = []command.ProjectContext{}
@@ -73,7 +78,7 @@ func (cb *CommandScopedStatsProjectCommandContextBuilder) BuildProjectContext(
 		// specifically use the command name in the context instead of the arg
 		// since we can return multiple commands worth of contexts for a given command name arg
 		// to effectively pipeline them.
-		cmd.SetScope(cmd.CommandName.String())
+		cmd.Scope = cmd.SetProjectScopeTags(cmd.Scope)
 		projectCmds = append(projectCmds, cmd)
 	}
 
@@ -87,10 +92,12 @@ type DefaultProjectCommandContextBuilder struct {
 func (cb *DefaultProjectCommandContextBuilder) BuildProjectContext(
 	ctx *command.Context,
 	cmdName command.Name,
+	subName string,
 	prjCfg valid.MergedProjectCfg,
 	commentFlags []string,
 	repoDir string,
-	automerge, deleteSourceBranchOnMerge, parallelApply, parallelPlan, verbose bool,
+	automerge, parallelApply, parallelPlan, verbose, abortOnExecutionOrderFail bool,
+	terraformClient tfclient.Client,
 ) (projectCmds []command.ProjectContext) {
 	ctx.Log.Debug("Building project command context for %s", cmdName)
 
@@ -105,31 +112,45 @@ func (cb *DefaultProjectCommandContextBuilder) BuildProjectContext(
 		steps = []valid.Step{{
 			StepName: "version",
 		}}
+	case command.Import:
+		steps = prjCfg.Workflow.Import.Steps
+	case command.State:
+		switch subName {
+		case "rm":
+			steps = prjCfg.Workflow.StateRm.Steps
+		default:
+			// comment_parser prevent invalid subcommand, so not need to handle this.
+			// if comes here, state_command_runner will respond on PR, so it's enough to do log only.
+			ctx.Log.Err("unknown state subcommand: %s", subName)
+		}
 	}
 
 	// If TerraformVersion not defined in config file look for a
 	// terraform.require_version block.
 	if prjCfg.TerraformVersion == nil {
-		prjCfg.TerraformVersion = getTfVersion(ctx, filepath.Join(repoDir, prjCfg.RepoRelDir))
+		prjCfg.TerraformVersion = terraformClient.DetectVersion(ctx.Log, filepath.Join(repoDir, prjCfg.RepoRelDir))
 	}
 
 	projectCmdContext := newProjectCommandContext(
 		ctx,
 		cmdName,
-		cb.CommentBuilder.BuildApplyComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name, prjCfg.AutoMergeDisabled),
+		subName,
+		cb.CommentBuilder.BuildApplyComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name, prjCfg.AutoMergeDisabled, prjCfg.AutoMergeMethod),
+		cb.CommentBuilder.BuildApprovePoliciesComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name),
 		cb.CommentBuilder.BuildPlanComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name, commentFlags),
-		cb.CommentBuilder.BuildVersionComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name),
 		prjCfg,
 		steps,
 		prjCfg.PolicySets,
 		escapeArgs(commentFlags),
 		automerge,
-		deleteSourceBranchOnMerge,
 		parallelApply,
 		parallelPlan,
 		verbose,
+		abortOnExecutionOrderFail,
 		ctx.Scope,
 		ctx.PullRequestStatus,
+		ctx.PullStatus,
+		ctx.TeamAllowlistChecker,
 	)
 
 	projectCmds = append(projectCmds, projectCmdContext)
@@ -145,53 +166,65 @@ type PolicyCheckProjectCommandContextBuilder struct {
 func (cb *PolicyCheckProjectCommandContextBuilder) BuildProjectContext(
 	ctx *command.Context,
 	cmdName command.Name,
+	subCmdName string,
 	prjCfg valid.MergedProjectCfg,
 	commentFlags []string,
 	repoDir string,
-	automerge, deleteSourceBranchOnMerge, parallelApply, parallelPlan, verbose bool,
+	automerge, parallelApply, parallelPlan, verbose, abortOnExecutionOrderFail bool,
+	terraformClient tfclient.Client,
 ) (projectCmds []command.ProjectContext) {
-	ctx.Log.Debug("PolicyChecks are enabled")
+	if prjCfg.PolicyCheck {
+		ctx.Log.Debug("PolicyChecks are enabled")
+	} else {
+		// PolicyCheck is disabled at repository level
+		ctx.Log.Debug("PolicyChecks are disabled on this repository")
+	}
 
 	// If TerraformVersion not defined in config file look for a
 	// terraform.require_version block.
 	if prjCfg.TerraformVersion == nil {
-		prjCfg.TerraformVersion = getTfVersion(ctx, filepath.Join(repoDir, prjCfg.RepoRelDir))
+		prjCfg.TerraformVersion = terraformClient.DetectVersion(ctx.Log, filepath.Join(repoDir, prjCfg.RepoRelDir))
 	}
 
 	projectCmds = cb.ProjectCommandContextBuilder.BuildProjectContext(
 		ctx,
 		cmdName,
+		subCmdName,
 		prjCfg,
 		commentFlags,
 		repoDir,
 		automerge,
-		deleteSourceBranchOnMerge,
 		parallelApply,
 		parallelPlan,
 		verbose,
+		abortOnExecutionOrderFail,
+		terraformClient,
 	)
 
-	if cmdName == command.Plan {
+	if cmdName == command.Plan && prjCfg.PolicyCheck {
 		ctx.Log.Debug("Building project command context for %s", command.PolicyCheck)
 		steps := prjCfg.Workflow.PolicyCheck.Steps
 
 		projectCmds = append(projectCmds, newProjectCommandContext(
 			ctx,
 			command.PolicyCheck,
-			cb.CommentBuilder.BuildApplyComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name, prjCfg.AutoMergeDisabled),
+			"",
+			cb.CommentBuilder.BuildApplyComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name, prjCfg.AutoMergeDisabled, prjCfg.AutoMergeMethod),
+			cb.CommentBuilder.BuildApprovePoliciesComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name),
 			cb.CommentBuilder.BuildPlanComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name, commentFlags),
-			cb.CommentBuilder.BuildVersionComment(prjCfg.RepoRelDir, prjCfg.Workspace, prjCfg.Name),
 			prjCfg,
 			steps,
 			prjCfg.PolicySets,
 			escapeArgs(commentFlags),
 			automerge,
-			deleteSourceBranchOnMerge,
 			parallelApply,
 			parallelPlan,
 			verbose,
+			abortOnExecutionOrderFail,
 			ctx.Scope,
 			ctx.PullRequestStatus,
+			ctx.PullStatus,
+			ctx.TeamAllowlistChecker,
 		))
 	}
 
@@ -202,23 +235,27 @@ func (cb *PolicyCheckProjectCommandContextBuilder) BuildProjectContext(
 // ProjectCommandContext.
 func newProjectCommandContext(ctx *command.Context,
 	cmd command.Name,
+	subCommand string,
 	applyCmd string,
+	approvePoliciesCmd string,
 	planCmd string,
-	versionCmd string,
 	projCfg valid.MergedProjectCfg,
 	steps []valid.Step,
 	policySets valid.PolicySets,
 	escapedCommentArgs []string,
 	automergeEnabled bool,
-	deleteSourceBranchOnMerge,
 	parallelApplyEnabled bool,
 	parallelPlanEnabled bool,
 	verbose bool,
+	abortOnExecutionOrderFail bool,
 	scope tally.Scope,
-	pullStatus models.PullReqStatus,
+	pullReqStatus models.PullReqStatus,
+	pullStatus *models.PullStatus,
+	teamAllowlistChecker command.TeamAllowlistChecker,
 ) command.ProjectContext {
 
 	var projectPlanStatus models.ProjectPlanStatus
+	var projectPolicyStatus []models.PolicySetStatus
 
 	if ctx.PullStatus != nil {
 		for _, project := range ctx.PullStatus.Projects {
@@ -226,11 +263,13 @@ func newProjectCommandContext(ctx *command.Context,
 			// if name is not used, let's match the directory
 			if projCfg.Name == "" && project.RepoRelDir == projCfg.RepoRelDir {
 				projectPlanStatus = project.Status
+				projectPolicyStatus = project.PolicyStatus
 				break
 			}
 
 			if projCfg.Name != "" && project.ProjectName == projCfg.Name {
 				projectPlanStatus = project.Status
+				projectPolicyStatus = project.PolicyStatus
 				break
 			}
 		}
@@ -238,78 +277,60 @@ func newProjectCommandContext(ctx *command.Context,
 
 	return command.ProjectContext{
 		CommandName:                cmd,
+		SubCommand:                 subCommand,
 		ApplyCmd:                   applyCmd,
+		ApprovePoliciesCmd:         approvePoliciesCmd,
 		BaseRepo:                   ctx.Pull.BaseRepo,
 		EscapedCommentArgs:         escapedCommentArgs,
 		AutomergeEnabled:           automergeEnabled,
-		DeleteSourceBranchOnMerge:  deleteSourceBranchOnMerge,
+		DeleteSourceBranchOnMerge:  projCfg.DeleteSourceBranchOnMerge,
+		RepoLocksMode:              projCfg.RepoLocks.Mode,
+		CustomPolicyCheck:          projCfg.CustomPolicyCheck,
 		ParallelApplyEnabled:       parallelApplyEnabled,
 		ParallelPlanEnabled:        parallelPlanEnabled,
 		ParallelPolicyCheckEnabled: parallelPlanEnabled,
+		DependsOn:                  projCfg.DependsOn,
 		AutoplanEnabled:            projCfg.AutoplanEnabled,
 		Steps:                      steps,
 		HeadRepo:                   ctx.HeadRepo,
 		Log:                        ctx.Log,
 		Scope:                      scope,
 		ProjectPlanStatus:          projectPlanStatus,
+		ProjectPolicyStatus:        projectPolicyStatus,
 		Pull:                       ctx.Pull,
 		ProjectName:                projCfg.Name,
+		PlanRequirements:           projCfg.PlanRequirements,
 		ApplyRequirements:          projCfg.ApplyRequirements,
+		ImportRequirements:         projCfg.ImportRequirements,
 		RePlanCmd:                  planCmd,
 		RepoRelDir:                 projCfg.RepoRelDir,
 		RepoConfigVersion:          projCfg.RepoCfgVersion,
+		TerraformDistribution:      projCfg.TerraformDistribution,
 		TerraformVersion:           projCfg.TerraformVersion,
 		User:                       ctx.User,
 		Verbose:                    verbose,
 		Workspace:                  projCfg.Workspace,
 		PolicySets:                 policySets,
-		PullReqStatus:              pullStatus,
+		PolicySetTarget:            ctx.PolicySet,
+		ClearPolicyApproval:        ctx.ClearPolicyApproval,
+		PullReqStatus:              pullReqStatus,
+		PullStatus:                 pullStatus,
 		JobID:                      uuid.New().String(),
 		ExecutionOrderGroup:        projCfg.ExecutionOrderGroup,
+		AbortOnExecutionOrderFail:  abortOnExecutionOrderFail,
+		SilencePRComments:          projCfg.SilencePRComments,
+		TeamAllowlistChecker:       teamAllowlistChecker,
 	}
 }
 
 func escapeArgs(args []string) []string {
 	var escaped []string
 	for _, arg := range args {
-		var escapedArg string
+		var escapedArg strings.Builder
 		for i := range arg {
-			escapedArg += "\\" + string(arg[i])
+			escapedArg.WriteString("\\" + string(arg[i]))
 		}
-		escaped = append(escaped, escapedArg)
+		escaped = append(escaped, escapedArg.String())
 	}
 	return escaped
-}
-
-// Extracts required_version from Terraform configuration.
-// Returns nil if unable to determine version from configuration.
-func getTfVersion(ctx *command.Context, absProjDir string) *version.Version {
-	module, diags := tfconfig.LoadModule(absProjDir)
-	if diags.HasErrors() {
-		ctx.Log.Err("trying to detect required version: %s", diags.Error())
-		return nil
-	}
-
-	if len(module.RequiredCore) != 1 {
-		ctx.Log.Info("cannot determine which version to use from terraform configuration, detected %d possibilities.", len(module.RequiredCore))
-		return nil
-	}
-	requiredVersionSetting := module.RequiredCore[0]
-
-	// We allow `= x.y.z`, `=x.y.z` or `x.y.z` where `x`, `y` and `z` are integers.
-	re := regexp.MustCompile(`^=?\s*([^\s]+)\s*$`)
-	matched := re.FindStringSubmatch(requiredVersionSetting)
-	if len(matched) == 0 {
-		ctx.Log.Debug("did not specify exact version in terraform configuration, found %q", requiredVersionSetting)
-		return nil
-	}
-	ctx.Log.Debug("found required_version setting of %q", requiredVersionSetting)
-	version, err := version.NewVersion(matched[1])
-	if err != nil {
-		ctx.Log.Debug(err.Error())
-		return nil
-	}
-
-	ctx.Log.Info("detected module requires version: %q", version.String())
-	return version
 }

@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package bitbucketserver
 
 import (
@@ -11,10 +14,10 @@ import (
 	"strings"
 
 	"github.com/runatlantis/atlantis/server/events/vcs/common"
+	"github.com/runatlantis/atlantis/server/logging"
 
-	"github.com/pkg/errors"
+	validator "github.com/go-playground/validator/v10"
 	"github.com/runatlantis/atlantis/server/events/models"
-	validator "gopkg.in/go-playground/validator.v9"
 )
 
 // maxCommentLength is the maximum number of chars allowed by Bitbucket in a
@@ -22,11 +25,11 @@ import (
 const maxCommentLength = 32768
 
 type Client struct {
-	HTTPClient  *http.Client
-	Username    string
-	Password    string
+	httpClient  *http.Client
+	username    string
+	password    string
 	BaseURL     string
-	AtlantisURL string
+	atlantisURL string
 }
 
 type DeleteSourceBranch struct {
@@ -48,23 +51,23 @@ func NewClient(httpClient *http.Client, username string, password string, baseUR
 	}
 	parsedURL, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, errors.Wrapf(err, "parsing %s", baseURL)
+		return nil, fmt.Errorf("parsing %s: %w", baseURL, err)
 	}
 	if parsedURL.Scheme == "" {
 		return nil, fmt.Errorf("must have 'http://' or 'https://' in base url %q", baseURL)
 	}
 	return &Client{
-		HTTPClient:  httpClient,
-		Username:    username,
-		Password:    password,
+		httpClient:  httpClient,
+		username:    username,
+		password:    password,
 		BaseURL:     strings.TrimRight(parsedURL.String(), "/"),
-		AtlantisURL: atlantisURL,
+		atlantisURL: atlantisURL,
 	}, nil
 }
 
 // GetModifiedFiles returns the names of files that were modified in the merge request
 // relative to the repo root, e.g. parent/child/file.txt.
-func (b *Client) GetModifiedFiles(repo models.Repo, pull models.PullRequest) ([]string, error) {
+func (b *Client) GetModifiedFiles(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) ([]string, error) {
 	var files []string
 
 	projectKey, err := b.GetProjectKey(repo.Name, repo.SanitizedCloneURL)
@@ -76,17 +79,17 @@ func (b *Client) GetModifiedFiles(repo models.Repo, pull models.PullRequest) ([]
 		b.BaseURL, projectKey, repo.Name, pull.Num)
 	// We'll only loop 1000 times as a safety measure.
 	maxLoops := 1000
-	for i := 0; i < maxLoops; i++ {
+	for range maxLoops {
 		resp, err := b.makeRequest("GET", fmt.Sprintf("%s?start=%d", baseURL, nextPageStart), nil)
 		if err != nil {
 			return nil, err
 		}
 		var changes Changes
 		if err := json.Unmarshal(resp, &changes); err != nil {
-			return nil, errors.Wrapf(err, "Could not parse response %q", string(resp))
+			return nil, fmt.Errorf("parsing response %q: %w", string(resp), err)
 		}
 		if err := validator.New().Struct(changes); err != nil {
-			return nil, errors.Wrapf(err, "API response %q was missing fields", string(resp))
+			return nil, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
 		}
 		for _, v := range changes.Values {
 			files = append(files, *v.Path.ToString)
@@ -122,21 +125,19 @@ func (b *Client) GetProjectKey(repoName string, cloneURL string) (string, error)
 	expr := fmt.Sprintf(".*/(.*?)/%s\\.git", repoName)
 	capture, err := regexp.Compile(expr)
 	if err != nil {
-		return "", errors.Wrapf(err, "constructing regex from %q", expr)
+		return "", fmt.Errorf("constructing regex from %q: %w", expr, err)
 	}
 	matches := capture.FindStringSubmatch(cloneURL)
 	if len(matches) != 2 {
-		return "", fmt.Errorf("could not extract project key from %q, regex returned %q", cloneURL, strings.Join(matches, ","))
+		return "", fmt.Errorf("extracting project key from %q, regex returned %q", cloneURL, strings.Join(matches, ","))
 	}
 	return matches[1], nil
 }
 
 // CreateComment creates a comment on the merge request. It will write multiple
 // comments if a single comment is too long.
-func (b *Client) CreateComment(repo models.Repo, pullNum int, comment string, command string) error {
-	sepEnd := "\n```\n**Warning**: Output length greater than max comment size. Continued in next comment."
-	sepStart := "Continued from previous comment.\n```diff\n"
-	comments := common.SplitComment(comment, maxCommentLength, sepEnd, sepStart)
+func (b *Client) CreateComment(logger logging.SimpleLogging, repo models.Repo, pullNum int, comment string, command string) error {
+	comments := common.SplitComment(logger, comment, maxCommentLength, 0, command)
 	for _, c := range comments {
 		if err := b.postComment(repo, pullNum, c); err != nil {
 			return err
@@ -145,7 +146,11 @@ func (b *Client) CreateComment(repo models.Repo, pullNum int, comment string, co
 	return nil
 }
 
-func (b *Client) HidePrevCommandComments(repo models.Repo, pullNum int, command string) error {
+func (b *Client) ReactToComment(_ logging.SimpleLogging, _ models.Repo, _ int, _ int64, _ string) error {
+	return nil
+}
+
+func (b *Client) HidePrevCommandComments(_ logging.SimpleLogging, _ models.Repo, _ int, _ string, _ string) error {
 	return nil
 }
 
@@ -153,7 +158,7 @@ func (b *Client) HidePrevCommandComments(repo models.Repo, pullNum int, command 
 func (b *Client) postComment(repo models.Repo, pullNum int, comment string) error {
 	bodyBytes, err := json.Marshal(map[string]string{"text": comment})
 	if err != nil {
-		return errors.Wrap(err, "json encoding")
+		return fmt.Errorf("json encoding: %w", err)
 	}
 	projectKey, err := b.GetProjectKey(repo.Name, repo.SanitizedCloneURL)
 	if err != nil {
@@ -165,7 +170,7 @@ func (b *Client) postComment(repo models.Repo, pullNum int, comment string) erro
 }
 
 // PullIsApproved returns true if the merge request was approved.
-func (b *Client) PullIsApproved(repo models.Repo, pull models.PullRequest) (approvalStatus models.ApprovalStatus, err error) {
+func (b *Client) PullIsApproved(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) (approvalStatus models.ApprovalStatus, err error) {
 	projectKey, err := b.GetProjectKey(repo.Name, repo.SanitizedCloneURL)
 	if err != nil {
 		return approvalStatus, err
@@ -177,10 +182,10 @@ func (b *Client) PullIsApproved(repo models.Repo, pull models.PullRequest) (appr
 	}
 	var pullResp PullRequest
 	if err := json.Unmarshal(resp, &pullResp); err != nil {
-		return approvalStatus, errors.Wrapf(err, "Could not parse response %q", string(resp))
+		return approvalStatus, fmt.Errorf("parsing response %q: %w", string(resp), err)
 	}
 	if err := validator.New().Struct(pullResp); err != nil {
-		return approvalStatus, errors.Wrapf(err, "API response %q was missing fields", string(resp))
+		return approvalStatus, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
 	}
 	for _, reviewer := range pullResp.Reviewers {
 		if *reviewer.Approved {
@@ -192,32 +197,41 @@ func (b *Client) PullIsApproved(repo models.Repo, pull models.PullRequest) (appr
 	return approvalStatus, nil
 }
 
+func (b *Client) DiscardReviews(_ logging.SimpleLogging, _ models.Repo, _ models.PullRequest) error {
+	// TODO implement
+	return nil
+}
+
 // PullIsMergeable returns true if the merge request has no conflicts and can be merged.
-func (b *Client) PullIsMergeable(repo models.Repo, pull models.PullRequest, vcsstatusname string) (bool, error) {
+func (b *Client) PullIsMergeable(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest, _ string, _ []string) (models.MergeableStatus, error) {
 	projectKey, err := b.GetProjectKey(repo.Name, repo.SanitizedCloneURL)
 	if err != nil {
-		return false, err
+		return models.MergeableStatus{}, err
 	}
 	path := fmt.Sprintf("%s/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/merge", b.BaseURL, projectKey, repo.Name, pull.Num)
 	resp, err := b.makeRequest("GET", path, nil)
 	if err != nil {
-		return false, err
+		return models.MergeableStatus{}, err
 	}
 	var mergeStatus MergeStatus
 	if err := json.Unmarshal(resp, &mergeStatus); err != nil {
-		return false, errors.Wrapf(err, "Could not parse response %q", string(resp))
+		return models.MergeableStatus{}, fmt.Errorf("parsing response %q: %w", string(resp), err)
 	}
 	if err := validator.New().Struct(mergeStatus); err != nil {
-		return false, errors.Wrapf(err, "API response %q was missing fields", string(resp))
+		return models.MergeableStatus{}, fmt.Errorf("response %q was missing fields: %w", string(resp), err)
 	}
 	if *mergeStatus.CanMerge && !*mergeStatus.Conflicted {
-		return true, nil
+		return models.MergeableStatus{
+			IsMergeable: true,
+		}, nil
 	}
-	return false, nil
+	return models.MergeableStatus{
+		IsMergeable: false,
+	}, nil
 }
 
 // UpdateStatus updates the status of a commit.
-func (b *Client) UpdateStatus(repo models.Repo, pull models.PullRequest, status models.CommitStatus, src string, description string, url string) error {
+func (b *Client) UpdateStatus(logger logging.SimpleLogging, _ models.Repo, pull models.PullRequest, status models.CommitStatus, src string, description string, url string) error {
 	bbState := "FAILED"
 	switch status {
 	case models.PendingCommitStatus:
@@ -228,10 +242,12 @@ func (b *Client) UpdateStatus(repo models.Repo, pull models.PullRequest, status 
 		bbState = "FAILED"
 	}
 
+	logger.Info("Updating BitBucket commit status for '%s' to '%s'", src, bbState)
+
 	// URL is a required field for bitbucket statuses. We default to the
 	// Atlantis server's URL.
 	if url == "" {
-		url = b.AtlantisURL
+		url = b.atlantisURL
 	}
 
 	bodyBytes, err := json.Marshal(map[string]string{
@@ -243,14 +259,14 @@ func (b *Client) UpdateStatus(repo models.Repo, pull models.PullRequest, status 
 
 	path := fmt.Sprintf("%s/rest/build-status/1.0/commits/%s", b.BaseURL, pull.HeadCommit)
 	if err != nil {
-		return errors.Wrap(err, "json encoding")
+		return fmt.Errorf("json encoding: %w", err)
 	}
 	_, err = b.makeRequest("POST", path, bytes.NewBuffer(bodyBytes))
 	return err
 }
 
 // MergePull merges the pull request.
-func (b *Client) MergePull(pull models.PullRequest, pullOptions models.PullRequestOptions) error {
+func (b *Client) MergePull(logger logging.SimpleLogging, pull models.PullRequest, pullOptions models.PullRequestOptions) error {
 	projectKey, err := b.GetProjectKey(pull.BaseRepo.Name, pull.BaseRepo.SanitizedCloneURL)
 	if err != nil {
 		return err
@@ -264,10 +280,10 @@ func (b *Client) MergePull(pull models.PullRequest, pullOptions models.PullReque
 	}
 	var pullResp PullRequest
 	if err := json.Unmarshal(resp, &pullResp); err != nil {
-		return errors.Wrapf(err, "Could not parse response %q", string(resp))
+		return fmt.Errorf("parsing response %q: %w", string(resp), err)
 	}
 	if err := validator.New().Struct(pullResp); err != nil {
-		return errors.Wrapf(err, "API response %q was missing fields", string(resp))
+		return fmt.Errorf("response %q was missing fields: %w", string(resp), err)
 	}
 	path = fmt.Sprintf("%s/rest/api/1.0/projects/%s/repos/%s/pull-requests/%d/merge?version=%d", b.BaseURL, projectKey, pull.BaseRepo.Name, pull.Num, *pullResp.Version)
 	_, err = b.makeRequest("POST", path, nil)
@@ -277,7 +293,7 @@ func (b *Client) MergePull(pull models.PullRequest, pullOptions models.PullReque
 	if pullOptions.DeleteSourceBranchOnMerge {
 		bodyBytes, err := json.Marshal(DeleteSourceBranch{Name: "refs/heads/" + pull.HeadBranch, DryRun: false})
 		if err != nil {
-			return errors.Wrap(err, "json encoding")
+			return fmt.Errorf("json encoding: %w", err)
 		}
 
 		path = fmt.Sprintf("%s/rest/branch-utils/1.0/projects/%s/repos/%s/branches", b.BaseURL, projectKey, pull.BaseRepo.Name)
@@ -300,7 +316,11 @@ func (b *Client) prepRequest(method string, path string, body io.Reader) (*http.
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(b.Username, b.Password)
+
+	// Personal access tokens can be sent as basic auth or bearer
+	bearer := "Bearer " + b.password
+	req.Header.Add("Authorization", bearer)
+
 	if body != nil {
 		req.Header.Add("Content-Type", "application/json")
 	}
@@ -313,9 +333,9 @@ func (b *Client) prepRequest(method string, path string, body io.Reader) (*http.
 func (b *Client) makeRequest(method string, path string, reqBody io.Reader) ([]byte, error) {
 	req, err := b.prepRequest(method, path, reqBody)
 	if err != nil {
-		return nil, errors.Wrap(err, "constructing request")
+		return nil, fmt.Errorf("constructing request: %w", err)
 	}
-	resp, err := b.HTTPClient.Do(req)
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -328,27 +348,31 @@ func (b *Client) makeRequest(method string, path string, reqBody io.Reader) ([]b
 	}
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, errors.Wrapf(err, "reading response from request %q", requestStr)
+		return nil, fmt.Errorf("reading response from request %q: %w", requestStr, err)
 	}
 	return respBody, nil
 }
 
 // GetTeamNamesForUser returns the names of the teams or groups that the user belongs to (in the organization the repository belongs to).
-func (b *Client) GetTeamNamesForUser(repo models.Repo, user models.User) ([]string, error) {
+func (b *Client) GetTeamNamesForUser(_ logging.SimpleLogging, _ models.Repo, _ models.User) ([]string, error) {
 	return nil, nil
 }
 
-func (b *Client) SupportsSingleFileDownload(repo models.Repo) bool {
+func (b *Client) SupportsSingleFileDownload(_ models.Repo) bool {
 	return false
 }
 
-// DownloadRepoConfigFile return `atlantis.yaml` content from VCS (which support fetch a single file from repository)
-// The first return value indicate that repo contain atlantis.yaml or not
-// if BaseRepo had one repo config file, its content will placed on the second return value
-func (b *Client) DownloadRepoConfigFile(pull models.PullRequest) (bool, []byte, error) {
+// GetFileContent a repository file content from VCS (which support fetch a single file from repository)
+// The first return value indicates whether the repo contains a file or not
+// if BaseRepo had a file, its content will placed on the second return value
+func (b *Client) GetFileContent(_ logging.SimpleLogging, _ models.Repo, _ string, _ string) (bool, []byte, error) {
 	return false, []byte{}, fmt.Errorf("not implemented")
 }
 
-func (b *Client) GetCloneURL(VCSHostType models.VCSHostType, repo string) (string, error) {
+func (b *Client) GetCloneURL(_ logging.SimpleLogging, _ models.VCSHostType, _ string) (string, error) {
 	return "", fmt.Errorf("not yet implemented")
+}
+
+func (b *Client) GetPullLabels(_ logging.SimpleLogging, _ models.Repo, _ models.PullRequest) ([]string, error) {
+	return nil, fmt.Errorf("not yet implemented")
 }

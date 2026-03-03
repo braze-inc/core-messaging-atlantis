@@ -15,29 +15,42 @@ package events
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 
-	"github.com/google/go-github/v31/github"
-	"github.com/mcdafydd/go-azuredevops/azuredevops"
-	"github.com/pkg/errors"
+	giteasdk "code.gitea.io/sdk/gitea"
+
+	"github.com/drmaxgit/go-azuredevops/azuredevops"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/go-github/v83/github"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketserver"
-	"github.com/xanzy/go-gitlab"
-	"gopkg.in/go-playground/validator.v9"
+	"github.com/runatlantis/atlantis/server/events/vcs/gitea"
+	"github.com/runatlantis/atlantis/server/logging"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
 const gitlabPullOpened = "opened"
 const usagesCols = 90
 
+var lastBitbucketSha, _ = lru.New[string, string](300)
+
 // PullCommand is a command to run on a pull request.
 type PullCommand interface {
+	// Dir is the path relative to the repo root to run the command in.
+	// Will never end in "/". If empty then the comment specified no directory.
+	Dir() string
 	// CommandName is the name of the command we're running.
 	CommandName() command.Name
+	// SubCommandName is the subcommand name of the command we're running.
+	SubCommandName() string
 	// IsVerbose is true if the output of this command should be verbose.
 	IsVerbose() bool
 	// IsAutoplan is true if this is an autoplan command vs. a comment command.
@@ -51,6 +64,16 @@ type PolicyCheckCommand struct{}
 // CommandName is policy_check.
 func (c PolicyCheckCommand) CommandName() command.Name {
 	return command.PolicyCheck
+}
+
+// SubCommandName is a subcommand for policy_check.
+func (c PolicyCheckCommand) SubCommandName() string {
+	return ""
+}
+
+// Dir is empty
+func (c PolicyCheckCommand) Dir() string {
+	return ""
 }
 
 // IsVerbose is false for policy_check commands.
@@ -70,6 +93,16 @@ type AutoplanCommand struct{}
 // CommandName is plan.
 func (c AutoplanCommand) CommandName() command.Name {
 	return command.Plan
+}
+
+// SubCommandName is a subcommand for auto plan.
+func (c AutoplanCommand) SubCommandName() string {
+	return ""
+}
+
+// Dir is empty
+func (c AutoplanCommand) Dir() string {
+	return ""
 }
 
 // IsVerbose is false for autoplan commands.
@@ -92,8 +125,12 @@ type CommentCommand struct {
 	Flags []string
 	// Name is the name of the command the comment specified.
 	Name command.Name
+	// SubName is the name of the sub command the comment specified.
+	SubName string
 	// AutoMergeDisabled is true if the command should not automerge after apply.
 	AutoMergeDisabled bool
+	// AutoMergeMethod specified the merge method for the VCS if automerge enabled.
+	AutoMergeMethod string
 	// Verbose is true if the command should output verbosely.
 	Verbose bool
 	// Workspace is the name of the Terraform workspace to run the command in.
@@ -103,6 +140,10 @@ type CommentCommand struct {
 	// project specified in an atlantis.yaml file.
 	// If empty then the comment specified no project.
 	ProjectName string
+	// PolicySet is the name of a policy set to run an approval on.
+	PolicySet string
+	// ClearPolicyApproval is true if approvals should be cleared out for specified policies.
+	ClearPolicyApproval bool
 }
 
 // IsForSpecificProject returns true if the command is for a specific dir, workspace
@@ -112,9 +153,19 @@ func (c CommentCommand) IsForSpecificProject() bool {
 	return c.RepoRelDir != "" || c.Workspace != "" || c.ProjectName != ""
 }
 
+// Dir returns the dir of this command.
+func (c CommentCommand) Dir() string {
+	return c.RepoRelDir
+}
+
 // CommandName returns the name of this command.
 func (c CommentCommand) CommandName() command.Name {
 	return c.Name
+}
+
+// SubCommandName returns the name of this subcommand.
+func (c CommentCommand) SubCommandName() string {
+	return c.SubName
 }
 
 // IsVerbose is true if the command should give verbose output.
@@ -129,11 +180,11 @@ func (c CommentCommand) IsAutoplan() bool {
 
 // String returns a string representation of the command.
 func (c CommentCommand) String() string {
-	return fmt.Sprintf("command=%q verbose=%t dir=%q workspace=%q project=%q flags=%q", c.Name.String(), c.Verbose, c.RepoRelDir, c.Workspace, c.ProjectName, strings.Join(c.Flags, ","))
+	return fmt.Sprintf("command=%q, verbose=%t, dir=%q, workspace=%q, project=%q, policyset=%q, auto-merge-disabled=%t, auto-merge-method=%s, clear-policy-approval=%t, flags=%q", c.Name.String(), c.Verbose, c.RepoRelDir, c.Workspace, c.ProjectName, c.PolicySet, c.AutoMergeDisabled, c.AutoMergeMethod, c.ClearPolicyApproval, strings.Join(c.Flags, ","))
 }
 
 // NewCommentCommand constructs a CommentCommand, setting all missing fields to defaults.
-func NewCommentCommand(repoRelDir string, flags []string, name command.Name, verbose, autoMergeDisabled bool, workspace string, project string) *CommentCommand {
+func NewCommentCommand(repoRelDir string, flags []string, name command.Name, subName string, verbose, autoMergeDisabled bool, autoMergeMethod string, workspace string, project string, policySet string, clearPolicyApproval bool) *CommentCommand {
 	// If repoRelDir was empty we want to keep it that way to indicate that it
 	// wasn't specified in the comment.
 	if repoRelDir != "" {
@@ -143,17 +194,21 @@ func NewCommentCommand(repoRelDir string, flags []string, name command.Name, ver
 		}
 	}
 	return &CommentCommand{
-		RepoRelDir:        repoRelDir,
-		Flags:             flags,
-		Name:              name,
-		Verbose:           verbose,
-		Workspace:         workspace,
-		AutoMergeDisabled: autoMergeDisabled,
-		ProjectName:       project,
+		RepoRelDir:          repoRelDir,
+		Flags:               flags,
+		Name:                name,
+		SubName:             subName,
+		Verbose:             verbose,
+		Workspace:           workspace,
+		AutoMergeDisabled:   autoMergeDisabled,
+		AutoMergeMethod:     autoMergeMethod,
+		ProjectName:         project,
+		PolicySet:           policySet,
+		ClearPolicyApproval: clearPolicyApproval,
 	}
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_event_parsing.go EventParsing
+//go:generate pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_event_parsing.go EventParsing
 
 // EventParsing parses webhook events from different VCS hosts into their
 // respective Atlantis models.
@@ -163,7 +218,7 @@ type EventParsing interface {
 	// baseRepo is the repo that the pull request will be merged into.
 	// user is the pull request author.
 	// pullNum is the number of the pull request that triggered the webhook.
-	ParseGithubIssueCommentEvent(comment *github.IssueCommentEvent) (
+	ParseGithubIssueCommentEvent(logger logging.SimpleLogging, comment *github.IssueCommentEvent) (
 		baseRepo models.Repo, user models.User, pullNum int, err error)
 
 	// ParseGithubPull parses the response from the GitHub API endpoint (not
@@ -171,7 +226,7 @@ type EventParsing interface {
 	// pull is the parsed pull request.
 	// baseRepo is the repo the pull request will be merged into.
 	// headRepo is the repo the pull request branch is from.
-	ParseGithubPull(ghPull *github.PullRequest) (
+	ParseGithubPull(logger logging.SimpleLogging, ghPull *github.PullRequest) (
 		pull models.PullRequest, baseRepo models.Repo, headRepo models.Repo, err error)
 
 	// ParseGithubPullEvent parses GitHub pull request events.
@@ -180,7 +235,7 @@ type EventParsing interface {
 	// baseRepo is the repo the pull request will be merged into.
 	// headRepo is the repo the pull request branch is from.
 	// user is the pull request author.
-	ParseGithubPullEvent(pullEvent *github.PullRequestEvent) (
+	ParseGithubPullEvent(logger logging.SimpleLogging, pullEvent *github.PullRequestEvent) (
 		pull models.PullRequest, pullEventType models.PullRequestEventType,
 		baseRepo models.Repo, headRepo models.Repo, user models.User, err error)
 
@@ -210,7 +265,7 @@ type EventParsing interface {
 	// headRepo is the repo the merge request branch is from.
 	// user is the pull request author.
 	ParseGitlabMergeRequestCommentEvent(event gitlab.MergeCommentEvent) (
-		baseRepo models.Repo, headRepo models.Repo, user models.User, err error)
+		baseRepo models.Repo, headRepo models.Repo, commentID int, user models.User, err error)
 
 	// ParseGitlabMergeRequest parses the response from the GitLab API endpoint
 	// that returns a merge request.
@@ -241,7 +296,7 @@ type EventParsing interface {
 
 	// GetBitbucketCloudPullEventType returns the type of the pull request
 	// event given the Bitbucket Cloud header.
-	GetBitbucketCloudPullEventType(eventTypeHeader string) models.PullRequestEventType
+	GetBitbucketCloudPullEventType(eventTypeHeader string, sha string, pr string) models.PullRequestEventType
 
 	// ParseBitbucketServerPullEvent parses a pull request event from Bitbucket
 	// Server.
@@ -289,14 +344,25 @@ type EventParsing interface {
 	// ParseAzureDevopsRepo parses the response from the Azure DevOps API endpoint that
 	// returns a repo into the Atlantis model.
 	ParseAzureDevopsRepo(adRepo *azuredevops.GitRepository) (models.Repo, error)
+
+	ParseGiteaPullRequestEvent(event giteasdk.PullRequest) (
+		pull models.PullRequest, pullEventType models.PullRequestEventType,
+		baseRepo models.Repo, headRepo models.Repo, user models.User, err error)
+
+	ParseGiteaIssueCommentEvent(event gitea.GiteaIssueCommentPayload) (baseRepo models.Repo, user models.User, pullNum int, err error)
+
+	ParseGiteaPull(pull *giteasdk.PullRequest) (pullModel models.PullRequest, baseRepo models.Repo, headRepo models.Repo, err error)
 }
 
 // EventParser parses VCS events.
 type EventParser struct {
 	GithubUser         string
 	GithubToken        string
+	GithubTokenFile    string
 	GitlabUser         string
 	GitlabToken        string
+	GiteaUser          string
+	GiteaToken         string
 	AllowDraftPRs      bool
 	BitbucketUser      string
 	BitbucketToken     string
@@ -308,7 +374,17 @@ type EventParser struct {
 func (e *EventParser) ParseAPIPlanRequest(vcsHostType models.VCSHostType, repoFullName string, cloneURL string) (models.Repo, error) {
 	switch vcsHostType {
 	case models.Github:
-		return models.NewRepo(vcsHostType, repoFullName, cloneURL, e.GithubUser, e.GithubToken)
+		token := e.GithubToken
+		if e.GithubTokenFile != "" {
+			content, err := os.ReadFile(e.GithubTokenFile)
+			if err != nil {
+				return models.Repo{}, fmt.Errorf("failed reading github token file: %w", err)
+			}
+			token = string(content)
+		}
+		return models.NewRepo(vcsHostType, repoFullName, cloneURL, e.GithubUser, token)
+	case models.Gitea:
+		return models.NewRepo(vcsHostType, repoFullName, cloneURL, e.GiteaUser, e.GiteaToken)
 	case models.Gitlab:
 		return models.NewRepo(vcsHostType, repoFullName, cloneURL, e.GitlabUser, e.GitlabToken)
 	}
@@ -317,11 +393,18 @@ func (e *EventParser) ParseAPIPlanRequest(vcsHostType models.VCSHostType, repoFu
 
 // GetBitbucketCloudPullEventType returns the type of the pull request
 // event given the Bitbucket Cloud header.
-func (e *EventParser) GetBitbucketCloudPullEventType(eventTypeHeader string) models.PullRequestEventType {
+func (e *EventParser) GetBitbucketCloudPullEventType(eventTypeHeader string, sha string, pr string) models.PullRequestEventType {
 	switch eventTypeHeader {
 	case bitbucketcloud.PullCreatedHeader:
+		lastBitbucketSha.Add(pr, sha)
 		return models.OpenedPullEvent
 	case bitbucketcloud.PullUpdatedHeader:
+		lastSha, _ := lastBitbucketSha.Get(pr)
+		if sha == lastSha {
+			// No change, ignore
+			return models.OtherPullEvent
+		}
+		lastBitbucketSha.Add(pr, sha)
 		return models.UpdatedPullEvent
 	case bitbucketcloud.PullFulfilledHeader, bitbucketcloud.PullRejectedHeader:
 		return models.ClosedPullEvent
@@ -335,11 +418,11 @@ func (e *EventParser) GetBitbucketCloudPullEventType(eventTypeHeader string) mod
 func (e *EventParser) ParseBitbucketCloudPullCommentEvent(body []byte) (pull models.PullRequest, baseRepo models.Repo, headRepo models.Repo, user models.User, comment string, err error) {
 	var event bitbucketcloud.CommentEvent
 	if err = json.Unmarshal(body, &event); err != nil {
-		err = errors.Wrap(err, "parsing json")
+		err = fmt.Errorf("parsing json: %w", err)
 		return
 	}
 	if err = validator.New().Struct(event); err != nil {
-		err = errors.Wrapf(err, "API response %q was missing fields", string(body))
+		err = fmt.Errorf("API response %q was missing fields: %w", string(body), err)
 		return
 	}
 	pull, baseRepo, headRepo, user, err = e.parseCommonBitbucketCloudEventData(event.CommonEventData)
@@ -404,11 +487,11 @@ func (e *EventParser) parseCommonBitbucketCloudEventData(event bitbucketcloud.Co
 func (e *EventParser) ParseBitbucketCloudPullEvent(body []byte) (pull models.PullRequest, baseRepo models.Repo, headRepo models.Repo, user models.User, err error) {
 	var event bitbucketcloud.PullRequestEvent
 	if err = json.Unmarshal(body, &event); err != nil {
-		err = errors.Wrap(err, "parsing json")
+		err = fmt.Errorf("parsing json: %w", err)
 		return
 	}
 	if err = validator.New().Struct(event); err != nil {
-		err = errors.Wrapf(err, "API response %q was missing fields", string(body))
+		err = fmt.Errorf("API response %q was missing fields: %w", string(body), err)
 		return
 	}
 	pull, baseRepo, headRepo, user, err = e.parseCommonBitbucketCloudEventData(event.CommonEventData)
@@ -417,7 +500,7 @@ func (e *EventParser) ParseBitbucketCloudPullEvent(body []byte) (pull models.Pul
 
 // ParseGithubIssueCommentEvent parses GitHub pull request comment events.
 // See EventParsing for return value docs.
-func (e *EventParser) ParseGithubIssueCommentEvent(comment *github.IssueCommentEvent) (baseRepo models.Repo, user models.User, pullNum int, err error) {
+func (e *EventParser) ParseGithubIssueCommentEvent(logger logging.SimpleLogging, comment *github.IssueCommentEvent) (baseRepo models.Repo, user models.User, pullNum int, err error) {
 	baseRepo, err = e.ParseGithubRepo(comment.Repo)
 	if err != nil {
 		return
@@ -440,12 +523,12 @@ func (e *EventParser) ParseGithubIssueCommentEvent(comment *github.IssueCommentE
 
 // ParseGithubPullEvent parses GitHub pull request events.
 // See EventParsing for return value docs.
-func (e *EventParser) ParseGithubPullEvent(pullEvent *github.PullRequestEvent) (pull models.PullRequest, pullEventType models.PullRequestEventType, baseRepo models.Repo, headRepo models.Repo, user models.User, err error) {
+func (e *EventParser) ParseGithubPullEvent(logger logging.SimpleLogging, pullEvent *github.PullRequestEvent) (pull models.PullRequest, pullEventType models.PullRequestEventType, baseRepo models.Repo, headRepo models.Repo, user models.User, err error) {
 	if pullEvent.PullRequest == nil {
 		err = errors.New("pull_request is null")
 		return
 	}
-	pull, baseRepo, headRepo, err = e.ParseGithubPull(pullEvent.PullRequest)
+	pull, baseRepo, headRepo, err = e.ParseGithubPull(logger, pullEvent.PullRequest)
 	if err != nil {
 		return
 	}
@@ -489,7 +572,7 @@ func (e *EventParser) ParseGithubPullEvent(pullEvent *github.PullRequestEvent) (
 // ParseGithubPull parses the response from the GitHub API endpoint (not
 // from a webhook) that returns a pull request.
 // See EventParsing for return value docs.
-func (e *EventParser) ParseGithubPull(pull *github.PullRequest) (pullModel models.PullRequest, baseRepo models.Repo, headRepo models.Repo, err error) {
+func (e *EventParser) ParseGithubPull(logger logging.SimpleLogging, pull *github.PullRequest) (pullModel models.PullRequest, baseRepo models.Repo, headRepo models.Repo, err error) {
 	commit := pull.Head.GetSHA()
 	if commit == "" {
 		err = errors.New("head.sha is null")
@@ -553,37 +636,34 @@ func (e *EventParser) ParseGithubPull(pull *github.PullRequest) (pullModel model
 // returns a repo into the Atlantis model.
 // See EventParsing for return value docs.
 func (e *EventParser) ParseGithubRepo(ghRepo *github.Repository) (models.Repo, error) {
-	return models.NewRepo(models.Github, ghRepo.GetFullName(), ghRepo.GetCloneURL(), e.GithubUser, e.GithubToken)
+	token := e.GithubToken
+	if e.GithubTokenFile != "" {
+		content, err := os.ReadFile(e.GithubTokenFile)
+		if err != nil {
+			return models.Repo{}, fmt.Errorf("failed reading github token file: %w", err)
+		}
+		token = string(content)
+	}
+
+	return models.NewRepo(models.Github, ghRepo.GetFullName(), ghRepo.GetCloneURL(), e.GithubUser, token)
+}
+
+// ParseGiteaRepo parses the response from the Gitea API endpoint that
+// returns a repo into the Atlantis model.
+// See EventParsing for return value docs.
+func (e *EventParser) ParseGiteaRepo(repo giteasdk.Repository) (models.Repo, error) {
+	return models.NewRepo(models.Gitea, repo.FullName, repo.CloneURL, e.GiteaUser, e.GiteaToken)
 }
 
 // ParseGitlabMergeRequestUpdateEvent dives deeper into Gitlab merge request update events
 func (e *EventParser) ParseGitlabMergeRequestUpdateEvent(event gitlab.MergeEvent) models.PullRequestEventType {
 	// New commit to opened MR
-	if len(event.ObjectAttributes.OldRev) > 0 {
+	if len(event.ObjectAttributes.OldRev) > 0 ||
+		// Check for MR that has been marked as ready
+		(strings.HasPrefix(event.Changes.Title.Previous, "Draft:") && !strings.HasPrefix(event.Changes.Title.Current, "Draft:")) {
 		return models.UpdatedPullEvent
 	}
-
-	// Update Assignee
-	if len(event.Changes.Assignees.Previous) > 0 || len(event.Changes.Assignees.Current) > 0 {
-		return models.OtherPullEvent
-	}
-
-	// Update Description
-	if len(event.Changes.Description.Previous) > 0 || len(event.Changes.Description.Current) > 0 {
-		return models.OtherPullEvent
-	}
-
-	// Update Labels
-	if len(event.Changes.Labels.Previous) > 0 || len(event.Changes.Labels.Current) > 0 {
-		return models.OtherPullEvent
-	}
-
-	//Update Title
-	if len(event.Changes.Title.Previous) > 0 || len(event.Changes.Title.Current) > 0 {
-		return models.OtherPullEvent
-	}
-
-	return models.UpdatedPullEvent
+	return models.OtherPullEvent
 }
 
 // ParseGitlabMergeRequestEvent parses GitLab merge request events.
@@ -617,15 +697,23 @@ func (e *EventParser) ParseGitlabMergeRequestEvent(event gitlab.MergeEvent) (pul
 		BaseRepo:   baseRepo,
 	}
 
-	switch event.ObjectAttributes.Action {
-	case "open":
-		eventType = models.OpenedPullEvent
-	case "update":
-		eventType = e.ParseGitlabMergeRequestUpdateEvent(event)
-	case "merge", "close":
-		eventType = models.ClosedPullEvent
-	default:
+	// If it's a draft PR we ignore it for auto-planning if configured to do so
+	// however it's still possible for users to run plan on it manually via a
+	// comment so if any draft PR is closed we still need to check if we need
+	// to delete its locks.
+	if event.ObjectAttributes.WorkInProgress && event.ObjectAttributes.Action != "close" && !e.AllowDraftPRs {
 		eventType = models.OtherPullEvent
+	} else {
+		switch event.ObjectAttributes.Action {
+		case "open":
+			eventType = models.OpenedPullEvent
+		case "update":
+			eventType = e.ParseGitlabMergeRequestUpdateEvent(event)
+		case "merge", "close":
+			eventType = models.ClosedPullEvent
+		default:
+			eventType = models.OtherPullEvent
+		}
 	}
 
 	user = models.User{
@@ -638,10 +726,12 @@ func (e *EventParser) ParseGitlabMergeRequestEvent(event gitlab.MergeEvent) (pul
 // ParseGitlabMergeRequestCommentEvent parses GitLab merge request comment
 // events.
 // See EventParsing for return value docs.
-func (e *EventParser) ParseGitlabMergeRequestCommentEvent(event gitlab.MergeCommentEvent) (baseRepo models.Repo, headRepo models.Repo, user models.User, err error) {
+func (e *EventParser) ParseGitlabMergeRequestCommentEvent(event gitlab.MergeCommentEvent) (baseRepo models.Repo, headRepo models.Repo, commentID int, user models.User, err error) {
 	// Parse the base repo first.
+
 	repoFullName := event.Project.PathWithNamespace
 	cloneURL := event.Project.GitHTTPURL
+	commentID = event.ObjectAttributes.ID
 	baseRepo, err = models.NewRepo(models.Gitlab, repoFullName, cloneURL, e.GitlabUser, e.GitlabToken)
 	if err != nil {
 		return
@@ -654,6 +744,27 @@ func (e *EventParser) ParseGitlabMergeRequestCommentEvent(event gitlab.MergeComm
 	headRepoFullName := event.MergeRequest.Source.PathWithNamespace
 	headCloneURL := event.MergeRequest.Source.GitHTTPURL
 	headRepo, err = models.NewRepo(models.Gitlab, headRepoFullName, headCloneURL, e.GitlabUser, e.GitlabToken)
+	return
+}
+
+func (e *EventParser) ParseGiteaIssueCommentEvent(comment gitea.GiteaIssueCommentPayload) (baseRepo models.Repo, user models.User, pullNum int, err error) {
+	baseRepo, err = e.ParseGiteaRepo(comment.Repository)
+	if err != nil {
+		return
+	}
+	if comment.Comment.Body == "" || comment.Comment.Poster.UserName == "" {
+		err = errors.New("comment.user.login is null")
+		return
+	}
+	commenterUsername := comment.Comment.Poster.UserName
+	user = models.User{
+		Username: commenterUsername,
+	}
+	pullNum = int(comment.Issue.Index)
+	if pullNum == 0 {
+		err = errors.New("issue.number is null")
+		return
+	}
 	return
 }
 
@@ -701,11 +812,11 @@ func (e *EventParser) GetBitbucketServerPullEventType(eventTypeHeader string) mo
 func (e *EventParser) ParseBitbucketServerPullCommentEvent(body []byte) (pull models.PullRequest, baseRepo models.Repo, headRepo models.Repo, user models.User, comment string, err error) {
 	var event bitbucketserver.CommentEvent
 	if err = json.Unmarshal(body, &event); err != nil {
-		err = errors.Wrap(err, "parsing json")
+		err = fmt.Errorf("parsing json: %w", err)
 		return
 	}
 	if err = validator.New().Struct(event); err != nil {
-		err = errors.Wrapf(err, "API response %q was missing fields", string(body))
+		err = fmt.Errorf("API response %q was missing fields: %w", string(body), err)
 		return
 	}
 	pull, baseRepo, headRepo, user, err = e.parseCommonBitbucketServerEventData(event.CommonEventData)
@@ -775,11 +886,11 @@ func (e *EventParser) parseCommonBitbucketServerEventData(event bitbucketserver.
 func (e *EventParser) ParseBitbucketServerPullEvent(body []byte) (pull models.PullRequest, baseRepo models.Repo, headRepo models.Repo, user models.User, err error) {
 	var event bitbucketserver.PullRequestEvent
 	if err = json.Unmarshal(body, &event); err != nil {
-		err = errors.Wrap(err, "parsing json")
+		err = fmt.Errorf("parsing json: %w", err)
 		return
 	}
 	if err = validator.New().Struct(event); err != nil {
-		err = errors.Wrapf(err, "API response %q was missing fields", string(body))
+		err = fmt.Errorf("API response %q was missing fields: %w", string(body), err)
 		return
 	}
 	pull, baseRepo, headRepo, user, err = e.parseCommonBitbucketServerEventData(event.CommonEventData)
@@ -915,11 +1026,15 @@ func (e *EventParser) ParseAzureDevopsRepo(adRepo *azuredevops.GitRepository) (m
 
 		if strings.Contains(uri.Host, "visualstudio.com") {
 			owner = strings.Split(uri.Host, ".")[0]
-		} else if strings.Contains(uri.Host, "dev.azure.com") {
-			owner = strings.Split(uri.Path, "/")[1]
 		} else {
-			owner = strings.Split(uri.Path, "/")[1] // to support owner for self hosted
+			owner = strings.Split(uri.Path, "/")[1]
 		}
+		owner = strings.ToLower(owner)
+		// Important Issue
+		// Details in here: https://github.com/runatlantis/atlantis/issues/5595
+		// Original issue from 2018: https://github.com/runatlantis/atlantis/issues/1858
+		// Related Microsoft article: https://learn.microsoft.com/en-us/azure/devops/release-notes/2018/sep-10-azure-devops-launch#administration
+		// If Azure DevOps forces the usage of new url, we need to remove all the changes added on this pull request (1 line and 1 test)
 	}
 
 	// Construct our own clone URL so we always get the new dev.azure.com
@@ -933,8 +1048,133 @@ func (e *EventParser) ParseAzureDevopsRepo(adRepo *azuredevops.GitRepository) (m
 		host = "dev.azure.com"
 	}
 
-	cloneURL := fmt.Sprintf("https://%s/%s/%s/_git/%s", host, owner, project, repo)
+	cloneURL := ""
+	// If statement allows compatibility with legacy Visual Studio Team Foundation Services URLs.
+	// Else statement covers Azure DevOps Services URLs
+	if strings.Contains(host, "visualstudio.com") {
+		cloneURL = fmt.Sprintf("https://%s/%s/_git/%s", host, project, repo)
+	} else {
+		cloneURL = fmt.Sprintf("https://%s/%s/%s/_git/%s", host, owner, project, repo)
+	}
 	fmt.Println("%", cloneURL)
 	fullName := fmt.Sprintf("%s/%s/%s", owner, project, repo)
 	return models.NewRepo(models.AzureDevops, fullName, cloneURL, e.AzureDevopsUser, e.AzureDevopsToken)
+}
+
+func (e *EventParser) ParseGiteaPullRequestEvent(event giteasdk.PullRequest) (models.PullRequest, models.PullRequestEventType, models.Repo, models.Repo, models.User, error) {
+	var pullEventType models.PullRequestEventType
+
+	// Determine the event type based on the state of the pull request and whether it's merged.
+	switch {
+	case event.State == giteasdk.StateOpen:
+		pullEventType = models.OpenedPullEvent
+	case event.HasMerged:
+		pullEventType = models.ClosedPullEvent
+	default:
+		pullEventType = models.OtherPullEvent
+	}
+
+	// Parse the base repository.
+	baseRepo, err := models.NewRepo(
+		models.Gitea,
+		event.Base.Repository.FullName,
+		event.Base.Repository.CloneURL,
+		e.GiteaUser,
+		e.GiteaToken,
+	)
+	if err != nil {
+		return models.PullRequest{}, models.OtherPullEvent, models.Repo{}, models.Repo{}, models.User{}, err
+	}
+
+	// Parse the head repository.
+	headRepo, err := models.NewRepo(
+		models.Gitea,
+		event.Head.Repository.FullName,
+		event.Head.Repository.CloneURL,
+		e.GiteaUser,
+		e.GiteaToken,
+	)
+	if err != nil {
+		return models.PullRequest{}, models.OtherPullEvent, models.Repo{}, models.Repo{}, models.User{}, err
+	}
+
+	// Construct the pull request model.
+	pull := models.PullRequest{
+		Num:        int(event.Index),
+		URL:        event.HTMLURL,
+		HeadCommit: event.Head.Sha,
+		HeadBranch: (*event.Head).Ref,
+		BaseBranch: event.Base.Ref,
+		Author:     event.Poster.UserName,
+		BaseRepo:   baseRepo,
+	}
+
+	// Parse the user who made the pull request.
+	user := models.User{
+		Username: event.Poster.UserName,
+	}
+	return pull, pullEventType, baseRepo, headRepo, user, nil
+}
+
+// ParseGiteaPull parses the response from the Gitea API endpoint (not
+// from a webhook) that returns a pull request.
+// See EventParsing for return value docs.
+func (e *EventParser) ParseGiteaPull(pull *giteasdk.PullRequest) (pullModel models.PullRequest, baseRepo models.Repo, headRepo models.Repo, err error) {
+	commit := pull.Head.Sha
+	if commit == "" {
+		err = errors.New("head.sha is null")
+		return
+	}
+	url := pull.HTMLURL
+	if url == "" {
+		err = errors.New("html_url is null")
+		return
+	}
+	headBranch := pull.Head.Ref
+	if headBranch == "" {
+		err = errors.New("head.ref is null")
+		return
+	}
+	baseBranch := pull.Base.Ref
+	if baseBranch == "" {
+		err = errors.New("base.ref is null")
+		return
+	}
+
+	authorUsername := pull.Poster.UserName
+	if authorUsername == "" {
+		err = errors.New("user.login is null")
+		return
+	}
+	num := pull.Index
+	if num == 0 {
+		err = errors.New("number is null")
+		return
+	}
+
+	baseRepo, err = e.ParseGiteaRepo(*pull.Base.Repository)
+	if err != nil {
+		return
+	}
+	headRepo, err = e.ParseGiteaRepo(*pull.Head.Repository)
+	if err != nil {
+		return
+	}
+
+	pullState := models.ClosedPullState
+	if pull.State == "open" {
+		pullState = models.OpenPullState
+	}
+
+	pullModel = models.PullRequest{
+		Author:     authorUsername,
+		HeadBranch: headBranch,
+		HeadCommit: commit,
+		URL:        url,
+		Num:        int(num),
+		State:      pullState,
+		BaseRepo:   baseRepo,
+		BaseBranch: baseBranch,
+	}
+	return
 }

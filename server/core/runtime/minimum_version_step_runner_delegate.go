@@ -1,16 +1,18 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package runtime
 
 import (
 	"fmt"
 
 	"github.com/hashicorp/go-version"
-	"github.com/pkg/errors"
 	"github.com/runatlantis/atlantis/server/events/command"
 )
 
-// MinimumVersionStepRunnerDelegate ensures that a given step runner can't run unless the command version being used
+// minimumVersionStepRunnerDelegate ensures that a given step runner can't run unless the command version being used
 // is greater than a provided minimum
-type MinimumVersionStepRunnerDelegate struct {
+type minimumVersionStepRunnerDelegate struct {
 	minimumVersion   *version.Version
 	defaultTfVersion *version.Version
 	delegate         Runner
@@ -20,17 +22,17 @@ func NewMinimumVersionStepRunnerDelegate(minimumVersionStr string, defaultVersio
 	minimumVersion, err := version.NewVersion(minimumVersionStr)
 
 	if err != nil {
-		return &MinimumVersionStepRunnerDelegate{}, errors.Wrap(err, "initializing minimum version")
+		return &minimumVersionStepRunnerDelegate{}, fmt.Errorf("initializing minimum version: %w", err)
 	}
 
-	return &MinimumVersionStepRunnerDelegate{
+	return &minimumVersionStepRunnerDelegate{
 		minimumVersion:   minimumVersion,
 		defaultTfVersion: defaultVersion,
 		delegate:         delegate,
 	}, nil
 }
 
-func (r *MinimumVersionStepRunnerDelegate) Run(ctx command.ProjectContext, extraArgs []string, path string, envs map[string]string) (string, error) {
+func (r *minimumVersionStepRunnerDelegate) Run(ctx command.ProjectContext, extraArgs []string, path string, envs map[string]string) (string, error) {
 	tfVersion := r.defaultTfVersion
 	if ctx.TerraformVersion != nil {
 		tfVersion = ctx.TerraformVersion

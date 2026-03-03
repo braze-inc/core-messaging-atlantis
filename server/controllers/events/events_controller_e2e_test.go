@@ -1,7 +1,11 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,39 +13,43 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v31/github"
-	"github.com/hashicorp/go-getter"
+	"github.com/google/go-github/v83/github"
 	"github.com/hashicorp/go-version"
-	. "github.com/petergtz/pegomock"
+	. "github.com/petergtz/pegomock/v4"
+
 	"github.com/runatlantis/atlantis/server"
 	events_controllers "github.com/runatlantis/atlantis/server/controllers/events"
+	"github.com/runatlantis/atlantis/server/core/boltdb"
 	"github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
-	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	runtimemocks "github.com/runatlantis/atlantis/server/core/runtime/mocks"
-	runtimematchers "github.com/runatlantis/atlantis/server/core/runtime/mocks/matchers"
 	"github.com/runatlantis/atlantis/server/core/runtime/policy"
+	mock_policy "github.com/runatlantis/atlantis/server/core/runtime/policy/mocks"
 	"github.com/runatlantis/atlantis/server/core/terraform"
+	terraform_mocks "github.com/runatlantis/atlantis/server/core/terraform/mocks"
+	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/mocks"
-	"github.com/runatlantis/atlantis/server/events/mocks/matchers"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 	vcsmocks "github.com/runatlantis/atlantis/server/events/vcs/mocks"
 	"github.com/runatlantis/atlantis/server/events/webhooks"
 	jobmocks "github.com/runatlantis/atlantis/server/jobs/mocks"
 	"github.com/runatlantis/atlantis/server/logging"
-	"github.com/runatlantis/atlantis/server/metrics"
+	"github.com/runatlantis/atlantis/server/metrics/metricstest"
 	. "github.com/runatlantis/atlantis/testing"
 )
 
-const ConftestVersion = "0.25.0"
+// In the e2e test, we use `conftest` not `conftest$version`.
+// Because if depends on the version, we need to upgrade test base image before e2e fix it.
+const conftestCommand = "conftest"
 
 var applyLocker locking.ApplyLocker
 var userConfig server.UserConfig
@@ -52,19 +60,15 @@ var mockPreWorkflowHookRunner *runtimemocks.MockPreWorkflowHookRunner
 
 var mockPostWorkflowHookRunner *runtimemocks.MockPostWorkflowHookRunner
 
-func (m *NoopTFDownloader) GetFile(dst, src string, opts ...getter.ClientOption) error {
-	return nil
-}
-
-func (m *NoopTFDownloader) GetAny(dst, src string, opts ...getter.ClientOption) error {
-	return nil
+func (m *NoopTFDownloader) Install(_ string, _ string, _ *version.Version) (string, error) {
+	return "", nil
 }
 
 type LocalConftestCache struct {
 }
 
-func (m *LocalConftestCache) Get(key *version.Version) (string, error) {
-	return exec.LookPath(fmt.Sprintf("conftest%s", ConftestVersion))
+func (m *LocalConftestCache) Get(_ *version.Version) (string, error) {
+	return exec.LookPath(conftestCommand)
 }
 
 func TestGitHubWorkflow(t *testing.T) {
@@ -77,17 +81,23 @@ func TestGitHubWorkflow(t *testing.T) {
 
 	cases := []struct {
 		Description string
-		// RepoDir is relative to testfixtures/test-repos.
+		// RepoDir is relative to testdata/test-repos.
 		RepoDir string
+		// RepoConfigFile is path for atlantis.yaml
+		RepoConfigFile string
 		// ModifiedFiles are the list of files that have been modified in this
 		// pull request.
 		ModifiedFiles []string
 		// Comments are what our mock user writes to the pull request.
 		Comments []string
-		// DisableApply flag used by userConfig object when initializing atlantis server.
-		DisableApply bool
 		// ApplyLock creates an apply lock that temporarily disables apply command
 		ApplyLock bool
+		// AllowCommands flag what kind of atlantis commands are available.
+		AllowCommands []command.Name
+		// DisableAutoplan flag disable auto plans when any pull request is opened.
+		DisableAutoplan bool
+		// DisablePreWorkflowHooks if set to true, pre-workflow hooks will be disabled
+		DisablePreWorkflowHooks bool
 		// ExpAutomerge is true if we expect Atlantis to automerge.
 		ExpAutomerge bool
 		// ExpAutoplan is true if we expect Atlantis to autoplan.
@@ -102,7 +112,32 @@ func TestGitHubWorkflow(t *testing.T) {
 		// Atlantis writes to the pull request in order. A reply from a parallel operation
 		// will be matched using a substring check.
 		ExpReplies [][]string
+		// ExpAllowResponseCommentBack allow http response content with "Commenting back on pull request"
+		ExpAllowResponseCommentBack bool
+		// ExpParseFailedCount represents how many times test sends invalid commands
+		ExpParseFailedCount int
+		// ExpNoLocksToDelete whether we expect that there are no locks at the end to delete
+		ExpNoLocksToDelete bool
 	}{
+		{
+			Description:        "no comment or change",
+			RepoDir:            "simple",
+			ModifiedFiles:      []string{},
+			Comments:           []string{},
+			ExpReplies:         [][]string{},
+			ExpNoLocksToDelete: true,
+		},
+		{
+			Description:   "no comment",
+			RepoDir:       "simple",
+			ModifiedFiles: []string{"main.tf"},
+			Comments:      []string{},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-merge.txt"},
+			},
+			ExpAutoplan: true,
+		},
 		{
 			Description:   "simple",
 			RepoDir:       "simple",
@@ -188,6 +223,20 @@ func TestGitHubWorkflow(t *testing.T) {
 			},
 		},
 		{
+			Description:   "simple with allow commands",
+			RepoDir:       "simple",
+			AllowCommands: []command.Name{command.Plan, command.Apply},
+			Comments: []string{
+				"atlantis import ADDRESS ID",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-allow-command-unknown-import.txt"},
+			},
+			ExpAllowResponseCommentBack: true,
+			ExpParseFailedCount:         1,
+			ExpNoLocksToDelete:          true,
+		},
+		{
 			Description:   "simple with atlantis.yaml",
 			RepoDir:       "simple-yaml",
 			ModifiedFiles: []string{"main.tf"},
@@ -200,6 +249,25 @@ func TestGitHubWorkflow(t *testing.T) {
 				{"exp-output-autoplan.txt"},
 				{"exp-output-apply-staging.txt"},
 				{"exp-output-apply-default.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:             "simple with atlantis.yaml - autoplan disabled",
+			RepoDir:                 "simple-yaml",
+			ModifiedFiles:           []string{"main.tf"},
+			DisableAutoplan:         true,
+			DisablePreWorkflowHooks: true,
+			ExpAutoplan:             false,
+			Comments: []string{
+				"atlantis plan -w staging",
+				"atlantis plan -w default",
+				"atlantis apply -w staging",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-plan-staging.txt"},
+				{"exp-output-plan-default.txt"},
+				{"exp-output-apply-staging.txt"},
 				{"exp-output-merge.txt"},
 			},
 		},
@@ -218,6 +286,24 @@ func TestGitHubWorkflow(t *testing.T) {
 			},
 		},
 		{
+			Description:    "custom repo config file",
+			RepoDir:        "repo-config-file",
+			RepoConfigFile: "infrastructure/custom-name-atlantis.yaml",
+			ModifiedFiles: []string{
+				"infrastructure/staging/main.tf",
+				"infrastructure/production/main.tf",
+			},
+			ExpAutoplan: true,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
 			Description:   "modules staging only",
 			RepoDir:       "modules",
 			ModifiedFiles: []string{"staging/main.tf"},
@@ -227,6 +313,23 @@ func TestGitHubWorkflow(t *testing.T) {
 			},
 			ExpReplies: [][]string{
 				{"exp-output-autoplan-only-staging.txt"},
+				{"exp-output-apply-staging.txt"},
+				{"exp-output-merge-only-staging.txt"},
+			},
+		},
+		{
+			Description:             "modules staging only - autoplan disabled",
+			RepoDir:                 "modules",
+			ModifiedFiles:           []string{"staging/main.tf"},
+			DisableAutoplan:         true,
+			DisablePreWorkflowHooks: true,
+			ExpAutoplan:             false,
+			Comments: []string{
+				"atlantis plan -d staging",
+				"atlantis apply -d staging",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-plan-staging.txt"},
 				{"exp-output-apply-staging.txt"},
 				{"exp-output-merge-only-staging.txt"},
 			},
@@ -355,7 +458,6 @@ func TestGitHubWorkflow(t *testing.T) {
 			Description:   "global apply lock disables apply commands",
 			RepoDir:       "simple-yaml",
 			ModifiedFiles: []string{"main.tf"},
-			DisableApply:  false,
 			ApplyLock:     true,
 			ExpAutoplan:   true,
 			Comments: []string{
@@ -368,19 +470,159 @@ func TestGitHubWorkflow(t *testing.T) {
 			},
 		},
 		{
-			Description:   "disable apply flag always takes presedence",
+			Description:   "omitting apply from allow commands always takes precedence",
 			RepoDir:       "simple-yaml",
 			ModifiedFiles: []string{"main.tf"},
-			DisableApply:  true,
+			AllowCommands: []command.Name{command.Plan},
 			ApplyLock:     false,
 			ExpAutoplan:   true,
 			Comments: []string{
 				"atlantis apply",
 			},
+			ExpParseFailedCount:         1,
+			ExpAllowResponseCommentBack: true,
 			ExpReplies: [][]string{
 				{"exp-output-autoplan.txt"},
-				{"exp-output-apply-locked.txt"},
+				// Disabling apply is implementing by omitting it from the apply list
+				// See: https://github.com/runatlantis/atlantis/pull/2877
+				{"exp-output-allow-command-unknown-apply.txt"},
 				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:   "import single project",
+			RepoDir:       "import-single-project",
+			ModifiedFiles: []string{"main.tf"},
+			ExpAutoplan:   true,
+			Comments: []string{
+				"atlantis import random_id.dummy1 AA",
+				"atlantis apply",
+				"atlantis import random_id.dummy2 BB",
+				"atlantis plan",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-import-dummy1.txt"},
+				{"exp-output-apply-no-projects.txt"},
+				{"exp-output-import-dummy2.txt"},
+				{"exp-output-plan-again.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description: "import workspace",
+			RepoDir:     "import-workspace",
+			Comments: []string{
+				"atlantis import -d dir1 -w ops 'random_id.dummy1[0]' AA",
+				"atlantis import -p dir1-ops 'random_id.dummy2[0]' BB",
+				"atlantis plan -p dir1-ops",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-import-dir1-ops-dummy1.txt"},
+				{"exp-output-import-dir1-ops-dummy2.txt"},
+				{"exp-output-plan.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:   "import single project with -var",
+			RepoDir:       "import-single-project-var",
+			ModifiedFiles: []string{"main.tf"},
+			ExpAutoplan:   true,
+			Comments: []string{
+				"atlantis import 'random_id.for_each[\"overridden\"]' AA -- -var var=overridden",
+				"atlantis import random_id.count[0] BB",
+				"atlantis plan -- -var var=overridden",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-import-foreach.txt"},
+				{"exp-output-import-count.txt"},
+				{"exp-output-plan-again.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:   "import multiple project",
+			RepoDir:       "import-multiple-project",
+			ModifiedFiles: []string{"dir1/main.tf", "dir2/main.tf"},
+			ExpAutoplan:   true,
+			Comments: []string{
+				"atlantis import random_id.dummy1 AA",
+				"atlantis import -d dir1 random_id.dummy1 AA",
+				"atlantis plan",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-import-multiple-projects.txt"},
+				{"exp-output-import-dummy1.txt"},
+				{"exp-output-plan-again.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:   "state rm single project",
+			RepoDir:       "state-rm-single-project",
+			ModifiedFiles: []string{"main.tf"},
+			ExpAutoplan:   true,
+			Comments: []string{
+				"atlantis import random_id.simple AA",
+				"atlantis import 'random_id.for_each[\"overridden\"]' BB -- -var var=overridden",
+				"atlantis import random_id.count[0] BB",
+				"atlantis plan -- -var var=overridden",
+				"atlantis state rm 'random_id.for_each[\"overridden\"]' -- -lock=false",
+				"atlantis state rm random_id.count[0] random_id.simple",
+				"atlantis plan -- -var var=overridden",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-import-simple.txt"},
+				{"exp-output-import-foreach.txt"},
+				{"exp-output-import-count.txt"},
+				{"exp-output-plan.txt"},
+				{"exp-output-state-rm-foreach.txt"},
+				{"exp-output-state-rm-multiple.txt"},
+				{"exp-output-plan-again.txt"},
+				{"exp-output-merged.txt"},
+			},
+		},
+		{
+			Description: "state rm workspace",
+			RepoDir:     "state-rm-workspace",
+			Comments: []string{
+				"atlantis import -p dir1-ops 'random_id.dummy1[0]' AA",
+				"atlantis plan -p dir1-ops",
+				"atlantis state rm -p dir1-ops 'random_id.dummy1[0]'",
+				"atlantis plan -p dir1-ops",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-import-dummy1.txt"},
+				{"exp-output-plan.txt"},
+				{"exp-output-state-rm-dummy1.txt"},
+				{"exp-output-plan-again.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:   "state rm multiple project",
+			RepoDir:       "state-rm-multiple-project",
+			ModifiedFiles: []string{"dir1/main.tf", "dir2/main.tf"},
+			ExpAutoplan:   true,
+			Comments: []string{
+				"atlantis import -d dir1 random_id.dummy AA",
+				"atlantis import -d dir2 random_id.dummy BB",
+				"atlantis plan",
+				"atlantis state rm random_id.dummy",
+				"atlantis plan",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-import-dummy1.txt"},
+				{"exp-output-import-dummy2.txt"},
+				{"exp-output-plan.txt"},
+				{"exp-output-state-rm-multiple-projects.txt"},
+				{"exp-output-plan-again.txt"},
+				{"exp-output-merged.txt"},
 			},
 		},
 	}
@@ -390,18 +632,24 @@ func TestGitHubWorkflow(t *testing.T) {
 
 			// reset userConfig
 			userConfig = server.UserConfig{}
-			userConfig.DisableApply = c.DisableApply
 
-			ctrl, vcsClient, githubGetter, atlantisWorkspace := setupE2E(t, c.RepoDir)
+			opt := setupOption{
+				repoConfigFile:          c.RepoConfigFile,
+				allowCommands:           c.AllowCommands,
+				disableAutoplan:         c.DisableAutoplan,
+				disablePreWorkflowHooks: c.DisablePreWorkflowHooks,
+			}
+			ctrl, vcsClient, githubGetter, atlantisWorkspace := setupE2E(t, c.RepoDir, opt)
 			// Set the repo to be cloned through the testing backdoor.
-			repoDir, headSHA, cleanup := initializeRepo(t, c.RepoDir)
-			defer cleanup()
+			repoDir, headSHA := initializeRepo(t, c.RepoDir)
 			atlantisWorkspace.TestingOverrideHeadCloneURL = fmt.Sprintf("file://%s", repoDir)
 
 			// Setup test dependencies.
 			w := httptest.NewRecorder()
-			When(githubGetter.GetPullRequest(AnyRepo(), AnyInt())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
-			When(vcsClient.GetModifiedFiles(AnyRepo(), matchers.AnyModelsPullRequest())).ThenReturn(c.ModifiedFiles, nil)
+			When(githubGetter.GetPullRequest(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[int]())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
+			When(vcsClient.GetModifiedFiles(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest]())).ThenReturn(c.ModifiedFiles, nil)
 
 			// First, send the open pull request event which triggers autoplan.
 			pullOpenedReq := GitHubPullRequestOpenedEvent(t, headSHA)
@@ -418,7 +666,11 @@ func TestGitHubWorkflow(t *testing.T) {
 				commentReq := GitHubCommentEvent(t, comment)
 				w = httptest.NewRecorder()
 				ctrl.Post(w, commentReq)
-				ResponseContains(t, w, 200, "Processing...")
+				if c.ExpAllowResponseCommentBack {
+					ResponseContains(t, w, 200, "Commenting back on pull request")
+				} else {
+					ResponseContains(t, w, 200, "Processing...")
+				}
 			}
 
 			// Send the "pull closed" event which would be triggered by the
@@ -428,17 +680,29 @@ func TestGitHubWorkflow(t *testing.T) {
 			ctrl.Post(w, pullClosedReq)
 			ResponseContains(t, w, 200, "Pull request cleaned successfully")
 
+			expNumHooks := len(c.Comments) - c.ExpParseFailedCount
+			// if auto plan is disabled, hooks will not be called on pull request opened event
+			if !c.DisableAutoplan {
+				expNumHooks++
+			}
 			// Let's verify the pre-workflow hook was called for each comment including the pull request opened event
-			mockPreWorkflowHookRunner.VerifyWasCalled(Times(len(c.Comments)+1)).Run(runtimematchers.AnyModelsWorkflowHookCommandContext(), EqString("some dummy command"), AnyString())
-
+			if !c.DisablePreWorkflowHooks {
+				mockPreWorkflowHookRunner.VerifyWasCalled(Times(expNumHooks)).Run(Any[models.WorkflowHookCommandContext](),
+					Eq("some dummy command"), Any[string](), Any[string](), Any[string]())
+			}
 			// Let's verify the post-workflow hook was called for each comment including the pull request opened event
-			mockPostWorkflowHookRunner.VerifyWasCalled(Times(len(c.Comments)+1)).Run(runtimematchers.AnyModelsWorkflowHookCommandContext(), EqString("some post dummy command"), AnyString())
+			mockPostWorkflowHookRunner.VerifyWasCalled(Times(expNumHooks)).Run(Any[models.WorkflowHookCommandContext](),
+				Eq("some post dummy command"), Any[string](), Any[string](), Any[string]())
 
 			// Now we're ready to verify Atlantis made all the comments back (or
 			// replies) that we expect.  We expect each plan to have 1 comment,
-			// and apply have 1 for each comment plus one for the locks deleted at the
-			// end.
-			expNumReplies := len(c.Comments) + 1
+			// and apply have 1 for each comment
+			expNumReplies := len(c.Comments)
+
+			// If there are locks to delete at the end, that will take a comment
+			if !c.ExpNoLocksToDelete {
+				expNumReplies++
+			}
 
 			if c.ExpAutoplan {
 				expNumReplies++
@@ -448,7 +712,8 @@ func TestGitHubWorkflow(t *testing.T) {
 				expNumReplies++
 			}
 
-			_, _, actReplies, _ := vcsClient.VerifyWasCalled(Times(expNumReplies)).CreateComment(AnyRepo(), AnyInt(), AnyString(), AnyString()).GetAllCapturedArguments()
+			_, _, _, actReplies, _ := vcsClient.VerifyWasCalled(Times(expNumReplies)).CreateComment(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]()).GetAllCapturedArguments()
 			Assert(t, len(c.ExpReplies) == len(actReplies), "missing expected replies, got %d but expected %d", len(actReplies), len(c.ExpReplies))
 			for i, expReply := range c.ExpReplies {
 				assertCommentEquals(t, expReply, actReplies[i], c.RepoDir, c.ExpParallel)
@@ -456,15 +721,15 @@ func TestGitHubWorkflow(t *testing.T) {
 
 			if c.ExpAutomerge {
 				// Verify that the merge API call was made.
-				vcsClient.VerifyWasCalledOnce().MergePull(matchers.AnyModelsPullRequest(), matchers.AnyModelsPullRequestOptions())
+				vcsClient.VerifyWasCalledOnce().MergePull(Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.PullRequestOptions]())
 			} else {
-				vcsClient.VerifyWasCalled(Never()).MergePull(matchers.AnyModelsPullRequest(), matchers.AnyModelsPullRequestOptions())
+				vcsClient.VerifyWasCalled(Never()).MergePull(Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.PullRequestOptions]())
 			}
 		})
 	}
 }
 
-func TestSimlpleWorkflow_terraformLockFile(t *testing.T) {
+func TestSimpleWorkflow_terraformLockFile(t *testing.T) {
 
 	if testing.Short() {
 		t.SkipNow()
@@ -474,7 +739,7 @@ func TestSimlpleWorkflow_terraformLockFile(t *testing.T) {
 
 	cases := []struct {
 		Description string
-		// RepoDir is relative to testfixtures/test-repos.
+		// RepoDir is relative to testdata/test-repos.
 		RepoDir string
 		// ModifiedFiles are the list of files that have been modified in this
 		// pull request.
@@ -540,14 +805,12 @@ func TestSimlpleWorkflow_terraformLockFile(t *testing.T) {
 
 			// reset userConfig
 			userConfig = server.UserConfig{}
-			userConfig.DisableApply = true
 
-			ctrl, vcsClient, githubGetter, atlantisWorkspace := setupE2E(t, c.RepoDir)
+			ctrl, vcsClient, githubGetter, atlantisWorkspace := setupE2E(t, c.RepoDir, setupOption{})
 			// Set the repo to be cloned through the testing backdoor.
-			repoDir, headSHA, cleanup := initializeRepo(t, c.RepoDir)
-			defer cleanup()
+			repoDir, headSHA := initializeRepo(t, c.RepoDir)
 
-			oldLockFilePath, err := filepath.Abs(filepath.Join("testfixtures", "null_provider_lockfile_old_version"))
+			oldLockFilePath, err := filepath.Abs(filepath.Join("testdata", "null_provider_lockfile_old_version"))
 			Ok(t, err)
 			oldLockFileContent, err := os.ReadFile(oldLockFilePath)
 			Ok(t, err)
@@ -556,14 +819,16 @@ func TestSimlpleWorkflow_terraformLockFile(t *testing.T) {
 				runCmd(t, "", "cp", oldLockFilePath, fmt.Sprintf("%s/.terraform.lock.hcl", repoDir))
 				runCmd(t, repoDir, "git", "add", ".terraform.lock.hcl")
 				runCmd(t, repoDir, "git", "commit", "-am", "stage .terraform.lock.hcl")
+				// Update target sha since there's now an extra commit
+				headSHA = strings.TrimSpace(runCmd(t, repoDir, "git", "rev-parse", "HEAD"))
 			}
 
 			atlantisWorkspace.TestingOverrideHeadCloneURL = fmt.Sprintf("file://%s", repoDir)
 
 			// Setup test dependencies.
 			w := httptest.NewRecorder()
-			When(githubGetter.GetPullRequest(AnyRepo(), AnyInt())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
-			When(vcsClient.GetModifiedFiles(AnyRepo(), matchers.AnyModelsPullRequest())).ThenReturn(c.ModifiedFiles, nil)
+			When(githubGetter.GetPullRequest(Any[logging.SimpleLogging](), Any[models.Repo](), Any[int]())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
+			When(vcsClient.GetModifiedFiles(Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest]())).ThenReturn(c.ModifiedFiles, nil)
 
 			// First, send the open pull request event which triggers autoplan.
 			pullOpenedReq := GitHubPullRequestOpenedEvent(t, headSHA)
@@ -587,7 +852,7 @@ func TestSimlpleWorkflow_terraformLockFile(t *testing.T) {
 
 			if !c.LockFileTracked {
 				// replace the lock file generated by the previous init to simulate
-				// dependcies needing updating in a latter plan
+				// dependencies needing updating in a latter plan
 				runCmd(t, "", "cp", oldLockFilePath, fmt.Sprintf("%s/repos/runatlantis/atlantis-tests/2/default/.terraform.lock.hcl", atlantisWorkspace.DataDir))
 			}
 
@@ -615,14 +880,16 @@ func TestSimlpleWorkflow_terraformLockFile(t *testing.T) {
 			}
 
 			// Let's verify the pre-workflow hook was called for each comment including the pull request opened event
-			mockPreWorkflowHookRunner.VerifyWasCalled(Times(2)).Run(runtimematchers.AnyModelsWorkflowHookCommandContext(), EqString("some dummy command"), AnyString())
+			mockPreWorkflowHookRunner.VerifyWasCalled(Times(2)).Run(Any[models.WorkflowHookCommandContext](),
+				Eq("some dummy command"), Any[string](), Any[string](), Any[string]())
 
 			// Now we're ready to verify Atlantis made all the comments back (or
 			// replies) that we expect.  We expect each plan to have 1 comment,
 			// and apply have 1 for each comment plus one for the locks deleted at the
 			// end.
 
-			_, _, actReplies, _ := vcsClient.VerifyWasCalled(Times(2)).CreateComment(AnyRepo(), AnyInt(), AnyString(), AnyString()).GetAllCapturedArguments()
+			_, _, _, actReplies, _ := vcsClient.VerifyWasCalled(Times(2)).CreateComment(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]()).GetAllCapturedArguments()
 			Assert(t, len(c.ExpReplies) == len(actReplies), "missing expected replies, got %d but expected %d", len(actReplies), len(c.ExpReplies))
 			for i, expReply := range c.ExpReplies {
 				assertCommentEquals(t, expReply, actReplies[i], c.RepoDir, false)
@@ -637,22 +904,32 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 	}
 	// Ensure we have >= TF 0.14 locally.
 	ensureRunning014(t)
-	// Ensure we have >= Conftest 0.21 locally.
+	// Ensure we have conftest locally.
 	ensureRunningConftest(t)
 
 	cases := []struct {
 		Description string
-		// RepoDir is relative to testfixtures/test-repos.
+		// RepoDir is relative to testdata/test-repos.
 		RepoDir string
 		// ModifiedFiles are the list of files that have been modified in this
 		// pull request.
 		ModifiedFiles []string
 		// Comments are what our mock user writes to the pull request.
 		Comments []string
+		// PolicyCheck is true if we expect Atlantis to run policy checking
+		PolicyCheck bool
 		// ExpAutomerge is true if we expect Atlantis to automerge.
 		ExpAutomerge bool
 		// ExpAutoplan is true if we expect Atlantis to autoplan.
 		ExpAutoplan bool
+		// ExpPolicyChecks is true if we expect Atlantis to execute policy checks
+		ExpPolicyChecks bool
+		// ExpQuietPolicyChecks is true if we expect Atlantis to exclude policy check output
+		// when there's no error
+		ExpQuietPolicyChecks bool
+		// ExpQuietPolicyCheckFailure is true when we expect Atlantis to post back policy check failures
+		// even when QuietPolicyChecks is enabled
+		ExpQuietPolicyCheckFailure bool
 		// ExpParallel is true if we expect Atlantis to run parallel plans or applies.
 		ExpParallel bool
 		// ExpReplies is a list of files containing the expected replies that
@@ -661,10 +938,12 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 		ExpReplies [][]string
 	}{
 		{
-			Description:   "1 failing policy and 1 passing policy ",
-			RepoDir:       "policy-checks-multi-projects",
-			ModifiedFiles: []string{"dir1/main.tf,", "dir2/main.tf"},
-			ExpAutoplan:   true,
+			Description:     "1 failing policy and 1 passing policy ",
+			RepoDir:         "policy-checks-multi-projects",
+			ModifiedFiles:   []string{"dir1/main.tf,", "dir2/main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
 			Comments: []string{
 				"atlantis apply",
 			},
@@ -676,10 +955,31 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 			},
 		},
 		{
-			Description:   "failing policy without policies passing using extra args",
-			RepoDir:       "policy-checks-extra-args",
-			ModifiedFiles: []string{"main.tf"},
-			ExpAutoplan:   true,
+			Description:                "1 failing policy and 1 passing policy with --quiet-policy-checks",
+			RepoDir:                    "policy-checks-multi-projects",
+			ModifiedFiles:              []string{"dir1/main.tf,", "dir2/main.tf"},
+			PolicyCheck:                true,
+			ExpAutoplan:                true,
+			ExpPolicyChecks:            true,
+			ExpQuietPolicyChecks:       true,
+			ExpQuietPolicyCheckFailure: true,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-auto-policy-check-quiet.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "failing policy without policies passing using extra args",
+			RepoDir:         "policy-checks-extra-args",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
 			Comments: []string{
 				"atlantis apply",
 			},
@@ -691,10 +991,12 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 			},
 		},
 		{
-			Description:   "failing policy without policies passing",
-			RepoDir:       "policy-checks",
-			ModifiedFiles: []string{"main.tf"},
-			ExpAutoplan:   true,
+			Description:     "failing policy without policies passing",
+			RepoDir:         "policy-checks",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
 			Comments: []string{
 				"atlantis apply",
 			},
@@ -706,10 +1008,12 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 			},
 		},
 		{
-			Description:   "failing policy additional apply requirements specified",
-			RepoDir:       "policy-checks-apply-reqs",
-			ModifiedFiles: []string{"main.tf"},
-			ExpAutoplan:   true,
+			Description:     "failing policy without policies passing and custom run steps",
+			RepoDir:         "policy-checks-custom-run-steps",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
 			Comments: []string{
 				"atlantis apply",
 			},
@@ -721,10 +1025,29 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 			},
 		},
 		{
-			Description:   "failing policy approved by non owner",
-			RepoDir:       "policy-checks-diff-owner",
-			ModifiedFiles: []string{"main.tf"},
-			ExpAutoplan:   true,
+			Description:     "failing policy additional apply requirements specified",
+			RepoDir:         "policy-checks-apply-reqs",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-auto-policy-check.txt"},
+				{"exp-output-apply-failed.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "failing policy approved by non owner",
+			RepoDir:         "policy-checks-diff-owner",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
 			Comments: []string{
 				"atlantis approve_policies",
 				"atlantis apply",
@@ -737,6 +1060,143 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 				{"exp-output-merge.txt"},
 			},
 		},
+		{
+			Description:          "successful policy checks with quiet flag enabled",
+			RepoDir:              "policy-checks-success-silent",
+			ModifiedFiles:        []string{"main.tf"},
+			PolicyCheck:          true,
+			ExpAutoplan:          true,
+			ExpPolicyChecks:      true,
+			ExpQuietPolicyChecks: true,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:                "failing policy checks with quiet flag enabled",
+			RepoDir:                    "policy-checks",
+			ModifiedFiles:              []string{"main.tf"},
+			PolicyCheck:                true,
+			ExpAutoplan:                true,
+			ExpPolicyChecks:            true,
+			ExpQuietPolicyChecks:       true,
+			ExpQuietPolicyCheckFailure: true,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-auto-policy-check.txt"},
+				{"exp-output-apply-failed.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "failing policy with approval and policy approval clear",
+			RepoDir:         "policy-checks-clear-approval",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: true,
+			Comments: []string{
+				"atlantis approve_policies",
+				"atlantis approve_policies --clear-policy-approval",
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-auto-policy-check.txt"},
+				{"exp-output-approve-policies-success.txt"},
+				{"exp-output-approve-policies-clear.txt"},
+				{"exp-output-apply-failed.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "policy checking disabled on specific repo",
+			RepoDir:         "policy-checks-disabled-repo",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: false,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "policy checking disabled on specific repo server side",
+			RepoDir:         "policy-checks-disabled-repo-server-side",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: false,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "policy checking enabled on specific repo but disabled globally",
+			RepoDir:         "policy-checks-enabled-repo",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     false,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: false,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "policy checking enabled on specific repo server side but disabled globally",
+			RepoDir:         "policy-checks-enabled-repo-server-side",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     false,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: false,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
+		{
+			Description:     "policy checking disabled on previous regex match but not on repo",
+			RepoDir:         "policy-checks-disabled-previous-match",
+			ModifiedFiles:   []string{"main.tf"},
+			PolicyCheck:     true,
+			ExpAutoplan:     true,
+			ExpPolicyChecks: false,
+			Comments: []string{
+				"atlantis apply",
+			},
+			ExpReplies: [][]string{
+				{"exp-output-autoplan.txt"},
+				{"exp-output-apply.txt"},
+				{"exp-output-merge.txt"},
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -745,23 +1205,29 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 
 			// reset userConfig
 			userConfig = server.UserConfig{}
-			userConfig.EnablePolicyChecksFlag = true
+			userConfig.EnablePolicyChecksFlag = c.PolicyCheck
+			userConfig.QuietPolicyChecks = c.ExpQuietPolicyChecks
 
-			ctrl, vcsClient, githubGetter, atlantisWorkspace := setupE2E(t, c.RepoDir)
+			ctrl, vcsClient, githubGetter, atlantisWorkspace := setupE2E(t, c.RepoDir, setupOption{userConfig: userConfig})
 
 			// Set the repo to be cloned through the testing backdoor.
-			repoDir, headSHA, cleanup := initializeRepo(t, c.RepoDir)
-			defer cleanup()
+			repoDir, headSHA := initializeRepo(t, c.RepoDir)
 			atlantisWorkspace.TestingOverrideHeadCloneURL = fmt.Sprintf("file://%s", repoDir)
 
 			// Setup test dependencies.
 			w := httptest.NewRecorder()
-			When(vcsClient.PullIsMergeable(AnyRepo(), matchers.AnyModelsPullRequest(), "atlantis-test")).ThenReturn(true, nil)
-			When(vcsClient.PullIsApproved(AnyRepo(), matchers.AnyModelsPullRequest())).ThenReturn(models.ApprovalStatus{
+			When(vcsClient.PullIsMergeable(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest](), Eq("atlantis-test"), Eq([]string{}))).ThenReturn(models.MergeableStatus{
+				IsMergeable: true,
+			}, nil)
+			When(vcsClient.PullIsApproved(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest]())).ThenReturn(models.ApprovalStatus{
 				IsApproved: true,
 			}, nil)
-			When(githubGetter.GetPullRequest(AnyRepo(), AnyInt())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
-			When(vcsClient.GetModifiedFiles(AnyRepo(), matchers.AnyModelsPullRequest())).ThenReturn(c.ModifiedFiles, nil)
+			When(githubGetter.GetPullRequest(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[int]())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
+			When(vcsClient.GetModifiedFiles(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest]())).ThenReturn(c.ModifiedFiles, nil)
 
 			// First, send the open pull request event which triggers autoplan.
 			pullOpenedReq := GitHubPullRequestOpenedEvent(t, headSHA)
@@ -805,7 +1271,16 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 				expNumReplies++
 			}
 
-			_, _, actReplies, _ := vcsClient.VerifyWasCalled(Times(expNumReplies)).CreateComment(AnyRepo(), AnyInt(), AnyString(), AnyString()).GetAllCapturedArguments()
+			if c.ExpQuietPolicyChecks && !c.ExpQuietPolicyCheckFailure {
+				expNumReplies--
+			}
+
+			if !c.ExpPolicyChecks {
+				expNumReplies--
+			}
+			_, _, _, actReplies, _ := vcsClient.VerifyWasCalled(Times(expNumReplies)).CreateComment(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]()).GetAllCapturedArguments()
+
 			Assert(t, len(c.ExpReplies) == len(actReplies), "missing expected replies, got %d but expected %d", len(actReplies), len(c.ExpReplies))
 			for i, expReply := range c.ExpReplies {
 				assertCommentEquals(t, expReply, actReplies[i], c.RepoDir, c.ExpParallel)
@@ -813,26 +1288,26 @@ func TestGitHubWorkflowWithPolicyCheck(t *testing.T) {
 
 			if c.ExpAutomerge {
 				// Verify that the merge API call was made.
-				vcsClient.VerifyWasCalledOnce().MergePull(matchers.AnyModelsPullRequest(), matchers.AnyModelsPullRequestOptions())
+				vcsClient.VerifyWasCalledOnce().MergePull(Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.PullRequestOptions]())
 			} else {
-				vcsClient.VerifyWasCalled(Never()).MergePull(matchers.AnyModelsPullRequest(), matchers.AnyModelsPullRequestOptions())
+				vcsClient.VerifyWasCalled(Never()).MergePull(Any[logging.SimpleLogging](), Any[models.PullRequest](), Any[models.PullRequestOptions]())
 			}
 		})
 	}
 }
 
-func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsController, *vcsmocks.MockClient, *mocks.MockGithubPullGetter, *events.FileWorkspace) {
+type setupOption struct {
+	repoConfigFile          string
+	allowCommands           []command.Name
+	disableAutoplan         bool
+	disablePreWorkflowHooks bool
+	userConfig              server.UserConfig
+}
+
+func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers.VCSEventsController, *vcsmocks.MockClient, *mocks.MockGithubPullGetter, *events.FileWorkspace) {
 	allowForkPRs := false
-	dataDir, binDir, cacheDir, cleanup := mkSubDirs(t)
-	defer cleanup()
-
-	//env vars
-
-	if userConfig.EnablePolicyChecksFlag {
-		// need this to be set or we'll fail the policy check step
-		os.Setenv(policy.DefaultConftestVersionEnvKey, "0.25.0")
-	}
-
+	discardApprovalOnPlan := true
+	dataDir, binDir, cacheDir := mkSubDirs(t)
 	// Mocks.
 	e2eVCSClient := vcsmocks.NewMockClient()
 	e2eStatusUpdater := &events.DefaultCommitStatusUpdater{Client: e2eVCSClient}
@@ -841,6 +1316,7 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 	projectCmdOutputHandler := jobmocks.NewMockProjectCommandOutputHandler()
 
 	// Real dependencies.
+	logging.SuppressDefaultLogging()
 	logger := logging.NewNoopLogger(t)
 
 	eventParser := &events.EventParser{
@@ -849,39 +1325,61 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		GitlabUser:  "gitlab-user",
 		GitlabToken: "gitlab-token",
 	}
-	commentParser := &events.CommentParser{
-		GithubUser: "github-user",
-		GitlabUser: "gitlab-user",
+	allowCommands := command.AllCommentCommands
+	if opt.allowCommands != nil {
+		allowCommands = opt.allowCommands
 	}
-	terraformClient, err := terraform.NewClient(logger, binDir, cacheDir, "", "", "", "default-tf-version", "https://releases.hashicorp.com", &NoopTFDownloader{}, false, projectCmdOutputHandler)
+	disableApply := true
+	disableGlobalApplyLock := false
+	if slices.Contains(allowCommands, command.Apply) {
+		disableApply = false
+	}
+	commentParser := &events.CommentParser{
+		GithubUser:     "github-user",
+		GitlabUser:     "gitlab-user",
+		ExecutableName: "atlantis",
+		AllowCommands:  allowCommands,
+	}
+
+	mockDownloader := terraform_mocks.NewMockDownloader()
+	distribution := terraform.NewDistributionTerraformWithDownloader(mockDownloader)
+
+	terraformClient, err := tfclient.NewClient(logger, distribution, binDir, cacheDir, "", "", "", "default-tf-version", "https://releases.hashicorp.com", true, false, projectCmdOutputHandler)
 	Ok(t, err)
-	boltdb, err := db.New(dataDir)
+	b, err := boltdb.New(dataDir)
 	Ok(t, err)
-	lockingClient := locking.NewClient(boltdb)
-	applyLocker = locking.NewApplyClient(boltdb, userConfig.DisableApply)
+	database := b
+	lockingClient := locking.NewClient(b)
+	noOpLocker := locking.NewNoOpLocker()
+	applyLocker = locking.NewApplyClient(b, disableApply, disableGlobalApplyLock)
 	projectLocker := &events.DefaultProjectLocker{
-		Locker:    lockingClient,
-		VCSClient: e2eVCSClient,
+		Locker:     lockingClient,
+		NoOpLocker: noOpLocker,
+		VCSClient:  e2eVCSClient,
 	}
 	workingDir := &events.FileWorkspace{
 		DataDir:                     dataDir,
 		TestingOverrideHeadCloneURL: "override-me",
 	}
+	var preWorkflowHooks []*valid.WorkflowHook
+	if !opt.disablePreWorkflowHooks {
+		preWorkflowHooks = []*valid.WorkflowHook{
+			{
+				StepName:   "global_hook",
+				RunCommand: "some dummy command",
+			},
+		}
+	}
 
+	defaultTFDistribution := terraformClient.DefaultDistribution()
 	defaultTFVersion := terraformClient.DefaultVersion()
 	locker := events.NewDefaultWorkingDirLocker()
 	parser := &config.ParserValidator{}
 
 	globalCfgArgs := valid.GlobalCfgArgs{
-		AllowRepoCfg: true,
-		MergeableReq: false,
-		ApprovedReq:  false,
-		PreWorkflowHooks: []*valid.WorkflowHook{
-			{
-				StepName:   "global_hook",
-				RunCommand: "some dummy command",
-			},
-		},
+		RepoConfigFile:       opt.repoConfigFile,
+		AllowAllRepoSettings: true,
+		PreWorkflowHooks:     preWorkflowHooks,
 		PostWorkflowHooks: []*valid.WorkflowHook{
 			{
 				StepName:   "global_hook",
@@ -901,24 +1399,36 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 	parallelPoolSize := 1
 	silenceNoProjects := false
 
+	disableUnlockLabel := "do-not-unlock"
+
+	statusUpdater := runtimemocks.NewMockStatusUpdater()
+	commitStatusUpdater := mocks.NewMockCommitStatusUpdater()
+	asyncTfExec := runtimemocks.NewMockAsyncTFExec()
+
 	mockPreWorkflowHookRunner = runtimemocks.NewMockPreWorkflowHookRunner()
+	preWorkflowHookURLGenerator := mocks.NewMockPreWorkflowHookURLGenerator()
 	preWorkflowHooksCommandRunner := &events.DefaultPreWorkflowHooksCommandRunner{
 		VCSClient:             e2eVCSClient,
 		GlobalCfg:             globalCfg,
 		WorkingDirLocker:      locker,
 		WorkingDir:            workingDir,
 		PreWorkflowHookRunner: mockPreWorkflowHookRunner,
+		CommitStatusUpdater:   commitStatusUpdater,
+		Router:                preWorkflowHookURLGenerator,
 	}
 
 	mockPostWorkflowHookRunner = runtimemocks.NewMockPostWorkflowHookRunner()
+	postWorkflowHookURLGenerator := mocks.NewMockPostWorkflowHookURLGenerator()
 	postWorkflowHooksCommandRunner := &events.DefaultPostWorkflowHooksCommandRunner{
 		VCSClient:              e2eVCSClient,
 		GlobalCfg:              globalCfg,
 		WorkingDirLocker:       locker,
 		WorkingDir:             workingDir,
 		PostWorkflowHookRunner: mockPostWorkflowHookRunner,
+		CommitStatusUpdater:    commitStatusUpdater,
+		Router:                 postWorkflowHookURLGenerator,
 	}
-	statsScope, _, _ := metrics.NewLoggingScope(logger, "atlantis")
+	statsScope := metricstest.NewLoggingScope(t, logger, "atlantis")
 
 	projectCommandBuilder := events.NewProjectCommandBuilder(
 		userConfig.EnablePolicyChecksFlag,
@@ -932,67 +1442,96 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		commentParser,
 		false,
 		false,
+		false,
+		false,
+		false,
+		"",
 		"**/*.tf,**/*.tfvars,**/*.tfvars.json,**/terragrunt.hcl,**/.terraform.lock.hcl",
+		false,
+		false,
+		false,
+		"auto",
 		statsScope,
-		logger,
+		terraformClient,
 	)
 
-	showStepRunner, err := runtime.NewShowStepRunner(terraformClient, defaultTFVersion)
+	showStepRunner, err := runtime.NewShowStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion)
 
 	Ok(t, err)
 
-	conftestVersion, _ := version.NewVersion(ConftestVersion)
+	conftextExec := policy.NewConfTestExecutorWorkflow(logger, binDir, mock_policy.NewMockDownloader())
 
-	conftextExec := policy.NewConfTestExecutorWorkflow(logger, binDir, &NoopTFDownloader{})
-
-	// swapping out version cache to something that always returns local contest
+	// swapping out version cache to something that always returns local conftest
 	// binary
 	conftextExec.VersionCache = &LocalConftestCache{}
 
 	policyCheckRunner, err := runtime.NewPolicyCheckStepRunner(
-		conftestVersion,
+		defaultTFDistribution,
+		defaultTFVersion,
 		conftextExec,
 	)
 
 	Ok(t, err)
 
+	cancellationTracker := events.NewCancellationTracker()
+
 	projectCommandRunner := &events.DefaultProjectCommandRunner{
+		VcsClient:        e2eVCSClient,
 		Locker:           projectLocker,
 		LockURLGenerator: &mockLockURLGenerator{},
 		InitStepRunner: &runtime.InitStepRunner{
-			TerraformExecutor: terraformClient,
-			DefaultTFVersion:  defaultTFVersion,
+			TerraformExecutor:     terraformClient,
+			DefaultTFDistribution: defaultTFDistribution,
+			DefaultTFVersion:      defaultTFVersion,
 		},
-		PlanStepRunner: &runtime.PlanStepRunner{
-			TerraformExecutor: terraformClient,
-			DefaultTFVersion:  defaultTFVersion,
-		},
+		PlanStepRunner: runtime.NewPlanStepRunner(
+			terraformClient,
+			defaultTFDistribution,
+			defaultTFVersion,
+			statusUpdater,
+			asyncTfExec,
+		),
 		ShowStepRunner:        showStepRunner,
 		PolicyCheckStepRunner: policyCheckRunner,
 		ApplyStepRunner: &runtime.ApplyStepRunner{
 			TerraformExecutor: terraformClient,
 		},
+		ImportStepRunner:  runtime.NewImportStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion),
+		StateRmStepRunner: runtime.NewStateRmStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion),
 		RunStepRunner: &runtime.RunStepRunner{
 			TerraformExecutor:       terraformClient,
+			DefaultTFDistribution:   defaultTFDistribution,
 			DefaultTFVersion:        defaultTFVersion,
 			ProjectCmdOutputHandler: projectCmdOutputHandler,
 		},
 		WorkingDir:       workingDir,
 		Webhooks:         &mockWebhookSender{},
 		WorkingDirLocker: locker,
-		AggregateApplyRequirements: &events.AggregateApplyRequirements{
+		CommandRequirementHandler: &events.DefaultCommandRequirementHandler{
 			WorkingDir: workingDir,
 		},
+		CancellationTracker: cancellationTracker,
 	}
 
 	dbUpdater := &events.DBUpdater{
-		DB: boltdb,
+		Database: database,
 	}
 
 	pullUpdater := &events.PullUpdater{
 		HidePrevPlanComments: false,
 		VCSClient:            e2eVCSClient,
-		MarkdownRenderer:     &events.MarkdownRenderer{},
+		MarkdownRenderer: events.NewMarkdownRenderer(
+			false,                            // gitlabSupportsCommonMark
+			false,                            // disableApplyAll
+			false,                            // disableApply
+			false,                            // disableMarkdownFolding
+			false,                            // disableRepoLocking
+			false,                            // enableDiffMarkdownFormat
+			"",                               // markdownTemplateOverridesDir
+			"atlantis",                       // executableName
+			false,                            // hideUnchangedPlanComments
+			opt.userConfig.QuietPolicyChecks, // quietPolicyChecks
+		),
 	}
 
 	autoMerger := &events.AutoMerger{
@@ -1007,7 +1546,10 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		projectCommandRunner,
 		parallelPoolSize,
 		false,
+		userConfig.QuietPolicyChecks,
 	)
+
+	e2ePullReqStatusFetcher := vcs.NewPullReqStatusFetcher(e2eVCSClient, "atlantis-test", []string{})
 
 	planCommandRunner := events.NewPlanCommandRunner(
 		false,
@@ -1018,16 +1560,19 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		e2eStatusUpdater,
 		projectCommandBuilder,
 		projectCommandRunner,
+		cancellationTracker,
 		dbUpdater,
 		pullUpdater,
 		policyCheckCommandRunner,
 		autoMerger,
 		parallelPoolSize,
 		silenceNoProjects,
-		boltdb,
+		database,
+		lockingClient,
+		discardApprovalOnPlan,
+		e2ePullReqStatusFetcher,
+		false,
 	)
-
-	e2ePullReqStatusFetcher := vcs.NewPullReqStatusFetcher(e2eVCSClient)
 
 	applyCommandRunner := events.NewApplyCommandRunner(
 		e2eVCSClient,
@@ -1036,14 +1581,14 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		e2eStatusUpdater,
 		projectCommandBuilder,
 		projectCommandRunner,
+		cancellationTracker,
 		autoMerger,
 		pullUpdater,
 		dbUpdater,
-		boltdb,
+		database,
 		parallelPoolSize,
 		silenceNoProjects,
 		false,
-		"atlantis-test",
 		e2ePullReqStatusFetcher,
 	)
 
@@ -1055,12 +1600,14 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		dbUpdater,
 		silenceNoProjects,
 		false,
+		e2eVCSClient,
 	)
 
 	unlockCommandRunner := events.NewUnlockCommandRunner(
 		mocks.NewMockDeleteLockCommand(),
 		e2eVCSClient,
 		silenceNoProjects,
+		disableUnlockLabel,
 	)
 
 	versionCommandRunner := events.NewVersionCommandRunner(
@@ -1071,12 +1618,28 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		silenceNoProjects,
 	)
 
+	importCommandRunner := events.NewImportCommandRunner(
+		pullUpdater,
+		e2ePullReqStatusFetcher,
+		projectCommandBuilder,
+		projectCommandRunner,
+		silenceNoProjects,
+	)
+
+	stateCommandRunner := events.NewStateCommandRunner(
+		pullUpdater,
+		projectCommandBuilder,
+		projectCommandRunner,
+	)
+
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
 		command.Plan:            planCommandRunner,
 		command.Apply:           applyCommandRunner,
 		command.ApprovePolicies: approvePoliciesCommandRunner,
 		command.Unlock:          unlockCommandRunner,
 		command.Version:         versionCommandRunner,
+		command.Import:          importCommandRunner,
+		command.State:           stateCommandRunner,
 	}
 
 	commandRunner := &events.DefaultCommandRunner{
@@ -1093,7 +1656,9 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 		Drainer:                        drainer,
 		PreWorkflowHooksCommandRunner:  preWorkflowHooksCommandRunner,
 		PostWorkflowHooksCommandRunner: postWorkflowHooksCommandRunner,
-		PullStatusFetcher:              boltdb,
+		PullStatusFetcher:              database,
+		DisableAutoplan:                opt.disableAutoplan,
+		CommitStatusUpdater:            commitStatusUpdater,
 	}
 
 	repoAllowlistChecker, err := events.NewRepoAllowlistChecker("*")
@@ -1106,7 +1671,7 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 			Locker:                   lockingClient,
 			VCSClient:                e2eVCSClient,
 			WorkingDir:               workingDir,
-			DB:                       boltdb,
+			Database:                 database,
 			PullClosedTemplate:       &events.PullClosedEventTemplate{},
 			LogStreamResourceCleaner: projectCmdOutputHandler,
 		},
@@ -1127,20 +1692,22 @@ func setupE2E(t *testing.T, repoDir string) (events_controllers.VCSEventsControl
 
 type mockLockURLGenerator struct{}
 
-func (m *mockLockURLGenerator) GenerateLockURL(lockID string) string {
+func (m *mockLockURLGenerator) GenerateLockURL(_ string) string {
 	return "lock-url"
 }
 
 type mockWebhookSender struct{}
 
-func (w *mockWebhookSender) Send(log logging.SimpleLogging, result webhooks.ApplyResult) error {
+func (w *mockWebhookSender) Send(_ logging.SimpleLogging, _ webhooks.ApplyResult) error {
 	return nil
 }
 
 func GitHubCommentEvent(t *testing.T, comment string) *http.Request {
-	requestJSON, err := os.ReadFile(filepath.Join("testfixtures", "githubIssueCommentEvent.json"))
+	requestJSON, err := os.ReadFile(filepath.Join("testdata", "githubIssueCommentEvent.json"))
 	Ok(t, err)
-	requestJSON = []byte(strings.Replace(string(requestJSON), "###comment body###", comment, 1))
+	escapedComment, err := json.Marshal(comment)
+	Ok(t, err)
+	requestJSON = []byte(strings.Replace(string(requestJSON), "\"###comment body###\"", string(escapedComment), 1))
 	req, err := http.NewRequest("POST", "/events", bytes.NewBuffer(requestJSON))
 	Ok(t, err)
 	req.Header.Set("Content-Type", "application/json")
@@ -1149,10 +1716,10 @@ func GitHubCommentEvent(t *testing.T, comment string) *http.Request {
 }
 
 func GitHubPullRequestOpenedEvent(t *testing.T, headSHA string) *http.Request {
-	requestJSON, err := os.ReadFile(filepath.Join("testfixtures", "githubPullRequestOpenedEvent.json"))
+	requestJSON, err := os.ReadFile(filepath.Join("testdata", "githubPullRequestOpenedEvent.json"))
 	Ok(t, err)
 	// Replace sha with expected sha.
-	requestJSONStr := strings.Replace(string(requestJSON), "c31fd9ea6f557ad2ea659944c3844a059b83bc5d", headSHA, -1)
+	requestJSONStr := strings.ReplaceAll(string(requestJSON), "c31fd9ea6f557ad2ea659944c3844a059b83bc5d", headSHA)
 	req, err := http.NewRequest("POST", "/events", bytes.NewBuffer([]byte(requestJSONStr)))
 	Ok(t, err)
 	req.Header.Set("Content-Type", "application/json")
@@ -1161,7 +1728,7 @@ func GitHubPullRequestOpenedEvent(t *testing.T, headSHA string) *http.Request {
 }
 
 func GitHubPullRequestClosedEvent(t *testing.T) *http.Request {
-	requestJSON, err := os.ReadFile(filepath.Join("testfixtures", "githubPullRequestClosedEvent.json"))
+	requestJSON, err := os.ReadFile(filepath.Join("testdata", "githubPullRequestClosedEvent.json"))
 	Ok(t, err)
 	req, err := http.NewRequest("POST", "/events", bytes.NewBuffer(requestJSON))
 	Ok(t, err)
@@ -1176,48 +1743,48 @@ func GitHubPullRequestParsed(headSHA string) *github.PullRequest {
 		headSHA = "13940d121be73f656e2132c6d7b4c8e87878ac8d"
 	}
 	return &github.PullRequest{
-		Number:  github.Int(2),
-		State:   github.String("open"),
-		HTMLURL: github.String("htmlurl"),
+		Number:  github.Ptr(2),
+		State:   github.Ptr("open"),
+		HTMLURL: github.Ptr("htmlurl"),
 		Head: &github.PullRequestBranch{
 			Repo: &github.Repository{
-				FullName: github.String("runatlantis/atlantis-tests"),
-				CloneURL: github.String("https://github.com/runatlantis/atlantis-tests.git"),
+				FullName: github.Ptr("runatlantis/atlantis-tests"),
+				CloneURL: github.Ptr("https://github.com/runatlantis/atlantis-tests.git"),
 			},
-			SHA: github.String(headSHA),
-			Ref: github.String("branch"),
+			SHA: github.Ptr(headSHA),
+			Ref: github.Ptr("branch"),
 		},
 		Base: &github.PullRequestBranch{
 			Repo: &github.Repository{
-				FullName: github.String("runatlantis/atlantis-tests"),
-				CloneURL: github.String("https://github.com/runatlantis/atlantis-tests.git"),
+				FullName: github.Ptr("runatlantis/atlantis-tests"),
+				CloneURL: github.Ptr("https://github.com/runatlantis/atlantis-tests.git"),
 			},
-			Ref: github.String("master"),
+			Ref: github.Ptr("main"),
 		},
 		User: &github.User{
-			Login: github.String("atlantisbot"),
+			Login: github.Ptr("atlantisbot"),
 		},
 	}
 }
 
 // absRepoPath returns the absolute path to the test repo under dir repoDir.
 func absRepoPath(t *testing.T, repoDir string) string {
-	path, err := filepath.Abs(filepath.Join("testfixtures", "test-repos", repoDir))
+	path, err := filepath.Abs(filepath.Join("testdata", "test-repos", repoDir))
 	Ok(t, err)
 	return path
 }
 
-// initializeRepo copies the repo data from testfixtures and initializes a new
+// initializeRepo copies the repo data from testdata and initializes a new
 // git repo in a temp directory. It returns that directory and a function
 // to run in a defer that will delete the dir.
 // The purpose of this function is to create a real git repository with a branch
 // called 'branch' from the files under repoDir. This is so we can check in
 // those files normally to this repo without needing a .git directory.
-func initializeRepo(t *testing.T, repoDir string) (string, string, func()) {
+func initializeRepo(t *testing.T, repoDir string) (string, string) {
 	originRepo := absRepoPath(t, repoDir)
 
 	// Copy the files to the temp dir.
-	destDir, cleanup := TempDir(t)
+	destDir := t.TempDir()
 	runCmd(t, "", "cp", "-r", fmt.Sprintf("%s/.", originRepo), destDir)
 
 	// Initialize the git repo.
@@ -1233,7 +1800,7 @@ func initializeRepo(t *testing.T, repoDir string) (string, string, func()) {
 	headSHA := runCmd(t, destDir, "git", "rev-parse", "HEAD")
 	headSHA = strings.Trim(headSHA, "\n")
 
-	return destDir, headSHA, cleanup
+	return destDir, headSHA
 }
 
 func runCmd(t *testing.T, dir string, name string, args ...string) string {
@@ -1302,8 +1869,8 @@ func assertCommentEquals(t *testing.T, expReplies []string, act string, repoDir 
 }
 
 // returns parent, bindir, cachedir, cleanup func
-func mkSubDirs(t *testing.T) (string, string, string, func()) {
-	tmp, cleanup := TempDir(t)
+func mkSubDirs(t *testing.T) (string, string, string) {
+	tmp := t.TempDir()
 	binDir := filepath.Join(tmp, "bin")
 	err := os.MkdirAll(binDir, 0700)
 	Ok(t, err)
@@ -1312,33 +1879,19 @@ func mkSubDirs(t *testing.T) (string, string, string, func()) {
 	err = os.MkdirAll(cachedir, 0700)
 	Ok(t, err)
 
-	return tmp, binDir, cachedir, cleanup
+	return tmp, binDir, cachedir
 }
 
-// Will fail test if conftest isn't in path and isn't version >= 0.25.0
+// Will fail test if conftest isn't in path
 func ensureRunningConftest(t *testing.T) {
-	localPath, err := exec.LookPath(fmt.Sprintf("conftest%s", ConftestVersion))
+	// use `conftest` command instead `conftest$version`, so tests may fail on the environment cause the output logs may become change by version.
+	t.Logf("conftest check may fail depends on conftest version. please use latest stable conftest.")
+	_, err := exec.LookPath(conftestCommand)
 	if err != nil {
-		t.Logf("conftest >= %s must be installed to run this test", ConftestVersion)
-		t.FailNow()
-	}
-	versionOutBytes, err := exec.Command(localPath, "--version").Output() // #nosec
-	if err != nil {
-		t.Logf("error running conftest version: %s", err)
-		t.FailNow()
-	}
-	versionOutput := string(versionOutBytes)
-	match := versionConftestRegex.FindStringSubmatch(versionOutput)
-	if len(match) <= 1 {
-		t.Logf("could not parse contest version from %s", versionOutput)
-		t.FailNow()
-	}
-	localVersion, err := version.NewVersion(match[1])
-	Ok(t, err)
-	minVersion, err := version.NewVersion(ConftestVersion)
-	Ok(t, err)
-	if localVersion.LessThan(minVersion) {
-		t.Logf("must have contest version >= %s, you have %s", minVersion, localVersion)
+		t.Logf(`%s must be installed to run this test
+- on local, please install conftest command or run 'make docker/test-all'
+- on CI, please check testing-env docker image contains conftest command. see testing/Dockerfile
+`, conftestCommand)
 		t.FailNow()
 	}
 }
@@ -1372,11 +1925,13 @@ func ensureRunning014(t *testing.T) {
 }
 
 // versionRegex extracts the version from `terraform version` output.
-//     Terraform v0.12.0-alpha4 (2c36829d3265661d8edbd5014de8090ea7e2a076)
-//	   => 0.12.0-alpha4
 //
-//     Terraform v0.11.10
-//	   => 0.11.10
-var versionRegex = regexp.MustCompile("Terraform v(.*?)(\\s.*)?\n")
-
-var versionConftestRegex = regexp.MustCompile("Version: (.*?)(\\s.*)?\n")
+//	    Terraform v0.12.0-alpha4 (2c36829d3265661d8edbd5014de8090ea7e2a076)
+//		   => 0.12.0-alpha4
+//
+//	    Terraform v0.11.10
+//		   => 0.11.10
+//
+//	    OpenTofu v1.0.0
+//		   => 1.0.0
+var versionRegex = regexp.MustCompile("(?:Terraform|OpenTofu) v(.*?)(\\s.*)?\n")

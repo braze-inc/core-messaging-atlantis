@@ -4,11 +4,10 @@
 package mocks
 
 import (
+	pegomock "github.com/petergtz/pegomock/v4"
+	webhooks "github.com/runatlantis/atlantis/server/events/webhooks"
 	"reflect"
 	"time"
-
-	pegomock "github.com/petergtz/pegomock"
-	webhooks "github.com/runatlantis/atlantis/server/events/webhooks"
 )
 
 type MockSlackClient struct {
@@ -30,45 +29,45 @@ func (mock *MockSlackClient) AuthTest() error {
 	if mock == nil {
 		panic("mock must not be nil. Use myMock := NewMockSlackClient().")
 	}
-	params := []pegomock.Param{}
-	result := pegomock.GetGenericMockFrom(mock).Invoke("AuthTest", params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
-	var ret0 error
-	if len(result) != 0 {
-		if result[0] != nil {
-			ret0 = result[0].(error)
+	_params := []pegomock.Param{}
+	_result := pegomock.GetGenericMockFrom(mock).Invoke("AuthTest", _params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
+	var _ret0 error
+	if len(_result) != 0 {
+		if _result[0] != nil {
+			_ret0 = _result[0].(error)
 		}
 	}
-	return ret0
-}
-
-func (mock *MockSlackClient) TokenIsSet() bool {
-	if mock == nil {
-		panic("mock must not be nil. Use myMock := NewMockSlackClient().")
-	}
-	params := []pegomock.Param{}
-	result := pegomock.GetGenericMockFrom(mock).Invoke("TokenIsSet", params, []reflect.Type{reflect.TypeOf((*bool)(nil)).Elem()})
-	var ret0 bool
-	if len(result) != 0 {
-		if result[0] != nil {
-			ret0 = result[0].(bool)
-		}
-	}
-	return ret0
+	return _ret0
 }
 
 func (mock *MockSlackClient) PostMessage(channel string, applyResult webhooks.ApplyResult) error {
 	if mock == nil {
 		panic("mock must not be nil. Use myMock := NewMockSlackClient().")
 	}
-	params := []pegomock.Param{channel, applyResult}
-	result := pegomock.GetGenericMockFrom(mock).Invoke("PostMessage", params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
-	var ret0 error
-	if len(result) != 0 {
-		if result[0] != nil {
-			ret0 = result[0].(error)
+	_params := []pegomock.Param{channel, applyResult}
+	_result := pegomock.GetGenericMockFrom(mock).Invoke("PostMessage", _params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
+	var _ret0 error
+	if len(_result) != 0 {
+		if _result[0] != nil {
+			_ret0 = _result[0].(error)
 		}
 	}
-	return ret0
+	return _ret0
+}
+
+func (mock *MockSlackClient) TokenIsSet() bool {
+	if mock == nil {
+		panic("mock must not be nil. Use myMock := NewMockSlackClient().")
+	}
+	_params := []pegomock.Param{}
+	_result := pegomock.GetGenericMockFrom(mock).Invoke("TokenIsSet", _params, []reflect.Type{reflect.TypeOf((*bool)(nil)).Elem()})
+	var _ret0 bool
+	if len(_result) != 0 {
+		if _result[0] != nil {
+			_ret0 = _result[0].(bool)
+		}
+	}
+	return _ret0
 }
 
 func (mock *MockSlackClient) VerifyWasCalledOnce() *VerifierMockSlackClient {
@@ -109,8 +108,8 @@ type VerifierMockSlackClient struct {
 }
 
 func (verifier *VerifierMockSlackClient) AuthTest() *MockSlackClient_AuthTest_OngoingVerification {
-	params := []pegomock.Param{}
-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "AuthTest", params, verifier.timeout)
+	_params := []pegomock.Param{}
+	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "AuthTest", _params, verifier.timeout)
 	return &MockSlackClient_AuthTest_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
 }
 
@@ -125,28 +124,9 @@ func (c *MockSlackClient_AuthTest_OngoingVerification) GetCapturedArguments() {
 func (c *MockSlackClient_AuthTest_OngoingVerification) GetAllCapturedArguments() {
 }
 
-func (verifier *VerifierMockSlackClient) TokenIsSet() *MockSlackClient_TokenIsSet_OngoingVerification {
-	params := []pegomock.Param{}
-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "TokenIsSet", params, verifier.timeout)
-	return &MockSlackClient_TokenIsSet_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
-}
-
-type MockSlackClient_TokenIsSet_OngoingVerification struct {
-	mock              *MockSlackClient
-	methodInvocations []pegomock.MethodInvocation
-}
-
-func (c *MockSlackClient_TokenIsSet_OngoingVerification) GetCapturedArguments() {
-}
-
-func (c *MockSlackClient_TokenIsSet_OngoingVerification) GetAllCapturedArguments() {
-}
-
-
-
 func (verifier *VerifierMockSlackClient) PostMessage(channel string, applyResult webhooks.ApplyResult) *MockSlackClient_PostMessage_OngoingVerification {
-	params := []pegomock.Param{channel, applyResult}
-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "PostMessage", params, verifier.timeout)
+	_params := []pegomock.Param{channel, applyResult}
+	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "PostMessage", _params, verifier.timeout)
 	return &MockSlackClient_PostMessage_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
 }
 
@@ -161,16 +141,37 @@ func (c *MockSlackClient_PostMessage_OngoingVerification) GetCapturedArguments()
 }
 
 func (c *MockSlackClient_PostMessage_OngoingVerification) GetAllCapturedArguments() (_param0 []string, _param1 []webhooks.ApplyResult) {
-	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
-	if len(params) > 0 {
-		_param0 = make([]string, len(c.methodInvocations))
-		for u, param := range params[0] {
-			_param0[u] = param.(string)
+	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+	if len(_params) > 0 {
+		if len(_params) > 0 {
+			_param0 = make([]string, len(c.methodInvocations))
+			for u, param := range _params[0] {
+				_param0[u] = param.(string)
+			}
 		}
-		_param1 = make([]webhooks.ApplyResult, len(c.methodInvocations))
-		for u, param := range params[1] {
-			_param1[u] = param.(webhooks.ApplyResult)
+		if len(_params) > 1 {
+			_param1 = make([]webhooks.ApplyResult, len(c.methodInvocations))
+			for u, param := range _params[1] {
+				_param1[u] = param.(webhooks.ApplyResult)
+			}
 		}
 	}
 	return
+}
+
+func (verifier *VerifierMockSlackClient) TokenIsSet() *MockSlackClient_TokenIsSet_OngoingVerification {
+	_params := []pegomock.Param{}
+	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "TokenIsSet", _params, verifier.timeout)
+	return &MockSlackClient_TokenIsSet_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
+}
+
+type MockSlackClient_TokenIsSet_OngoingVerification struct {
+	mock              *MockSlackClient
+	methodInvocations []pegomock.MethodInvocation
+}
+
+func (c *MockSlackClient_TokenIsSet_OngoingVerification) GetCapturedArguments() {
+}
+
+func (c *MockSlackClient_TokenIsSet_OngoingVerification) GetAllCapturedArguments() {
 }

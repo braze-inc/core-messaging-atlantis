@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events
 
 import (
@@ -47,7 +50,7 @@ func (v *VersionCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	var result command.Result
 	if v.isParallelEnabled(projectCmds) {
 		ctx.Log.Info("Running version in parallel")
-		result = runProjectCmdsParallel(projectCmds, v.prjCmdRunner.Version, v.parallelPoolSize)
+		result = runProjectCmdsParallelGroups(ctx, projectCmds, v.prjCmdRunner.Version, v.parallelPoolSize)
 	} else {
 		result = runProjectCmds(projectCmds, v.prjCmdRunner.Version)
 	}

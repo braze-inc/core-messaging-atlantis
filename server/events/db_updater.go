@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events
 
 import (
@@ -7,7 +10,7 @@ import (
 )
 
 type DBUpdater struct {
-	DB *db.BoltDB
+	Database db.Database
 }
 
 func (c *DBUpdater) updateDB(ctx *command.Context, pull models.PullRequest, results []command.ProjectResult) (models.PullStatus, error) {
@@ -23,5 +26,5 @@ func (c *DBUpdater) updateDB(ctx *command.Context, pull models.PullRequest, resu
 		filtered = append(filtered, r)
 	}
 	ctx.Log.Debug("updating DB with pull results")
-	return c.DB.UpdatePullWithResults(pull, filtered)
+	return c.Database.UpdatePullWithResults(pull, filtered)
 }

@@ -1,398 +1,53 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package runtime_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/go-version"
-	"github.com/runatlantis/atlantis/server/events/command"
-	mocks2 "github.com/runatlantis/atlantis/server/events/mocks"
-
-	. "github.com/petergtz/pegomock"
-	"github.com/pkg/errors"
+	. "github.com/petergtz/pegomock/v4"
 	"github.com/runatlantis/atlantis/server/core/runtime"
+	runtimemocks "github.com/runatlantis/atlantis/server/core/runtime/mocks"
 	runtimemodels "github.com/runatlantis/atlantis/server/core/runtime/models"
+	tf "github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/runatlantis/atlantis/server/core/terraform/mocks"
-	matchers2 "github.com/runatlantis/atlantis/server/core/terraform/mocks/matchers"
-	"github.com/runatlantis/atlantis/server/events/mocks/matchers"
+	tfclientmocks "github.com/runatlantis/atlantis/server/core/terraform/tfclient/mocks"
+	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 
 	. "github.com/runatlantis/atlantis/testing"
 )
 
-func TestRun_NoWorkspaceIn08(t *testing.T) {
-	// We don't want any workspace commands to be run in 0.8.
-	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
-
-	tfVersion, _ := version.NewVersion("0.8")
-
-	workspace := "default"
-	logger := logging.NewNoopLogger(t)
-	ctx := command.ProjectContext{
-		Log:                logger,
-		EscapedCommentArgs: []string{"comment", "args"},
-		Workspace:          workspace,
-		RepoRelDir:         ".",
-		User:               models.User{Username: "username"},
-		Pull: models.PullRequest{
-			Num: 2,
-		},
-		BaseRepo: models.Repo{
-			FullName: "owner/repo",
-			Owner:    "owner",
-			Name:     "repo",
-		},
-	}
-	s := runtime.PlanStepRunner{
-		DefaultTFVersion:  tfVersion,
-		TerraformExecutor: terraform,
-	}
-
-	When(terraform.RunCommandWithVersion(matchers.AnyModelsProjectCommandContext(), AnyString(), AnyStringSlice(), matchers2.AnyMapOfStringToString(), matchers2.AnyPtrToGoVersionVersion(), AnyString())).
-		ThenReturn("output", nil)
-	output, err := s.Run(ctx, []string{"extra", "args"}, "/path", map[string]string(nil))
-	Ok(t, err)
-
-	Equals(t, "output", output)
-	terraform.VerifyWasCalledOnce().RunCommandWithVersion(
-		ctx,
-		"/path",
-		[]string{"plan",
-			"-input=false",
-			"-refresh",
-			"-out",
-			"\"/path/default.tfplan\"",
-			"-var",
-			"atlantis_user=\"username\"",
-			"-var",
-			"atlantis_repo=\"owner/repo\"",
-			"-var",
-			"atlantis_repo_name=\"repo\"",
-			"-var",
-			"atlantis_repo_owner=\"owner\"",
-			"-var",
-			"atlantis_pull_num=2",
-			"extra",
-			"args",
-			"comment",
-			"args"},
-		map[string]string(nil),
-		tfVersion,
-		workspace)
-
-	// Verify that no env or workspace commands were run
-	terraform.VerifyWasCalled(Never()).RunCommandWithVersion(ctx,
-		"/path",
-		[]string{"env",
-			"select",
-			"workspace"},
-		map[string]string(nil),
-		tfVersion,
-		workspace)
-	terraform.VerifyWasCalled(Never()).RunCommandWithVersion(ctx,
-		"/path",
-		[]string{"workspace",
-			"select",
-			"workspace"},
-		map[string]string(nil),
-		tfVersion,
-		workspace)
-}
-
-func TestRun_ErrWorkspaceIn08(t *testing.T) {
-	// If they attempt to use a workspace other than default in 0.8
-	// we should error.
-	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
-
-	tfVersion, _ := version.NewVersion("0.8")
-	logger := logging.NewNoopLogger(t)
-	workspace := "notdefault"
-	s := runtime.PlanStepRunner{
-		TerraformExecutor: terraform,
-		DefaultTFVersion:  tfVersion,
-	}
-
-	When(terraform.RunCommandWithVersion(matchers.AnyModelsProjectCommandContext(), AnyString(), AnyStringSlice(), matchers2.AnyMapOfStringToString(), matchers2.AnyPtrToGoVersionVersion(), AnyString())).
-		ThenReturn("output", nil)
-	_, err := s.Run(command.ProjectContext{
-		Log:        logger,
-		Workspace:  workspace,
-		RepoRelDir: ".",
-		User:       models.User{Username: "username"},
-	}, []string{"extra", "args"}, "/path", map[string]string(nil))
-	ErrEquals(t, "terraform version 0.8.0 does not support workspaces", err)
-}
-
-func TestRun_SwitchesWorkspace(t *testing.T) {
-	RegisterMockTestingT(t)
-
-	cases := []struct {
-		tfVersion       string
-		expWorkspaceCmd string
-	}{
-		{
-			"0.9.0",
-			"env",
-		},
-		{
-			"0.9.11",
-			"env",
-		},
-		{
-			"0.10.0",
-			"workspace",
-		},
-		{
-			"0.11.0",
-			"workspace",
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.tfVersion, func(t *testing.T) {
-			terraform := mocks.NewMockClient()
-
-			tfVersion, _ := version.NewVersion(c.tfVersion)
-			logger := logging.NewNoopLogger(t)
-			ctx := command.ProjectContext{
-				Log:                logger,
-				Workspace:          "workspace",
-				RepoRelDir:         ".",
-				User:               models.User{Username: "username"},
-				EscapedCommentArgs: []string{"comment", "args"},
-				Pull: models.PullRequest{
-					Num: 2,
-				},
-				BaseRepo: models.Repo{
-					FullName: "owner/repo",
-					Owner:    "owner",
-					Name:     "repo",
-				},
-			}
-			s := runtime.PlanStepRunner{
-				TerraformExecutor: terraform,
-				DefaultTFVersion:  tfVersion,
-			}
-
-			When(terraform.RunCommandWithVersion(matchers.AnyModelsProjectCommandContext(), AnyString(), AnyStringSlice(), matchers2.AnyMapOfStringToString(), matchers2.AnyPtrToGoVersionVersion(), AnyString())).
-				ThenReturn("output", nil)
-			output, err := s.Run(ctx, []string{"extra", "args"}, "/path", map[string]string(nil))
-			Ok(t, err)
-
-			Equals(t, "output", output)
-			// Verify that env select was called as well as plan.
-			terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx,
-				"/path",
-				[]string{c.expWorkspaceCmd,
-					"select",
-					"workspace"},
-				map[string]string(nil),
-				tfVersion,
-				"workspace")
-			terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx,
-				"/path",
-				[]string{"plan",
-					"-input=false",
-					"-refresh",
-					"-out",
-					"\"/path/workspace.tfplan\"",
-					"-var",
-					"atlantis_user=\"username\"",
-					"-var",
-					"atlantis_repo=\"owner/repo\"",
-					"-var",
-					"atlantis_repo_name=\"repo\"",
-					"-var",
-					"atlantis_repo_owner=\"owner\"",
-					"-var",
-					"atlantis_pull_num=2",
-					"extra",
-					"args",
-					"comment",
-					"args"},
-				map[string]string(nil),
-				tfVersion,
-				"workspace")
-		})
-	}
-}
-
-func TestRun_CreatesWorkspace(t *testing.T) {
-	// Test that if `workspace select` fails, we call `workspace new`.
-	RegisterMockTestingT(t)
-
-	cases := []struct {
-		tfVersion           string
-		expWorkspaceCommand string
-	}{
-		{
-			"0.9.0",
-			"env",
-		},
-		{
-			"0.9.11",
-			"env",
-		},
-		{
-			"0.10.0",
-			"workspace",
-		},
-		{
-			"0.11.0",
-			"workspace",
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.tfVersion, func(t *testing.T) {
-			terraform := mocks.NewMockClient()
-			tfVersion, _ := version.NewVersion(c.tfVersion)
-			logger := logging.NewNoopLogger(t)
-			ctx := command.ProjectContext{
-				Log:                logger,
-				Workspace:          "workspace",
-				RepoRelDir:         ".",
-				User:               models.User{Username: "username"},
-				EscapedCommentArgs: []string{"comment", "args"},
-				Pull: models.PullRequest{
-					Num: 2,
-				},
-				BaseRepo: models.Repo{
-					FullName: "owner/repo",
-					Owner:    "owner",
-					Name:     "repo",
-				},
-			}
-			s := runtime.PlanStepRunner{
-				TerraformExecutor: terraform,
-				DefaultTFVersion:  tfVersion,
-			}
-
-			// Ensure that we actually try to switch workspaces by making the
-			// output of `workspace show` to be a different name.
-			When(terraform.RunCommandWithVersion(ctx, "/path", []string{"workspace", "show"}, map[string]string(nil), tfVersion, "workspace")).ThenReturn("diffworkspace\n", nil)
-
-			expWorkspaceArgs := []string{c.expWorkspaceCommand, "select", "workspace"}
-			When(terraform.RunCommandWithVersion(ctx, "/path", expWorkspaceArgs, map[string]string(nil), tfVersion, "workspace")).ThenReturn("", errors.New("workspace does not exist"))
-
-			expPlanArgs := []string{"plan",
-				"-input=false",
-				"-refresh",
-				"-out",
-				"\"/path/workspace.tfplan\"",
-				"-var",
-				"atlantis_user=\"username\"",
-				"-var",
-				"atlantis_repo=\"owner/repo\"",
-				"-var",
-				"atlantis_repo_name=\"repo\"",
-				"-var",
-				"atlantis_repo_owner=\"owner\"",
-				"-var",
-				"atlantis_pull_num=2",
-				"extra",
-				"args",
-				"comment",
-				"args"}
-			When(terraform.RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfVersion, "workspace")).ThenReturn("output", nil)
-
-			output, err := s.Run(ctx, []string{"extra", "args"}, "/path", map[string]string(nil))
-			Ok(t, err)
-
-			Equals(t, "output", output)
-			// Verify that env select was called as well as plan.
-			terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, "/path", expWorkspaceArgs, map[string]string(nil), tfVersion, "workspace")
-			terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfVersion, "workspace")
-		})
-	}
-}
-
-func TestRun_NoWorkspaceSwitchIfNotNecessary(t *testing.T) {
-	// Tests that if workspace show says we're on the right workspace we don't
-	// switch.
-	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
-	tfVersion, _ := version.NewVersion("0.10.0")
-	logger := logging.NewNoopLogger(t)
-	ctx := command.ProjectContext{
-		Log:                logger,
-		Workspace:          "workspace",
-		RepoRelDir:         ".",
-		User:               models.User{Username: "username"},
-		EscapedCommentArgs: []string{"comment", "args"},
-		Pull: models.PullRequest{
-			Num: 2,
-		},
-		BaseRepo: models.Repo{
-			FullName: "owner/repo",
-			Owner:    "owner",
-			Name:     "repo",
-		},
-	}
-	s := runtime.PlanStepRunner{
-		TerraformExecutor: terraform,
-		DefaultTFVersion:  tfVersion,
-	}
-	When(terraform.RunCommandWithVersion(ctx, "/path", []string{"workspace", "show"}, map[string]string(nil), tfVersion, "workspace")).ThenReturn("workspace\n", nil)
-
-	expPlanArgs := []string{"plan",
-		"-input=false",
-		"-refresh",
-		"-out",
-		"\"/path/workspace.tfplan\"",
-		"-var",
-		"atlantis_user=\"username\"",
-		"-var",
-		"atlantis_repo=\"owner/repo\"",
-		"-var",
-		"atlantis_repo_name=\"repo\"",
-		"-var",
-		"atlantis_repo_owner=\"owner\"",
-		"-var",
-		"atlantis_pull_num=2",
-		"extra",
-		"args",
-		"comment",
-		"args"}
-	When(terraform.RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfVersion, "workspace")).ThenReturn("output", nil)
-
-	output, err := s.Run(ctx, []string{"extra", "args"}, "/path", map[string]string(nil))
-	Ok(t, err)
-
-	Equals(t, "output", output)
-	terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfVersion, "workspace")
-
-	// Verify that workspace select was never called.
-	terraform.VerifyWasCalled(Never()).RunCommandWithVersion(ctx, "/path", []string{"workspace", "select", "workspace"}, map[string]string(nil), tfVersion, "workspace")
-}
-
 func TestRun_AddsEnvVarFile(t *testing.T) {
 	// Test that if env/workspace.tfvars file exists we use -var-file option.
 	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
+	terraform := tfclientmocks.NewMockClient()
+	commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+	asyncTfExec := runtimemocks.NewMockAsyncTFExec()
 
 	// Create the env/workspace.tfvars file.
-	tmpDir, cleanup := TempDir(t)
-	defer cleanup()
+	tmpDir := t.TempDir()
 	err := os.MkdirAll(filepath.Join(tmpDir, "env"), 0700)
 	Ok(t, err)
 	envVarsFile := filepath.Join(tmpDir, "env/workspace.tfvars")
 	err = os.WriteFile(envVarsFile, nil, 0600)
 	Ok(t, err)
 
+	mockDownloader := mocks.NewMockDownloader()
+	tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
 	// Using version >= 0.10 here so we don't expect any env commands.
 	tfVersion, _ := version.NewVersion("0.10.0")
 	logger := logging.NewNoopLogger(t)
-	s := runtime.PlanStepRunner{
-		TerraformExecutor: terraform,
-		DefaultTFVersion:  tfVersion,
-	}
+	s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTfExec)
 
 	expPlanArgs := []string{"plan",
 		"-input=false",
@@ -431,14 +86,14 @@ func TestRun_AddsEnvVarFile(t *testing.T) {
 			Name:     "repo",
 		},
 	}
-	When(terraform.RunCommandWithVersion(ctx, tmpDir, expPlanArgs, map[string]string(nil), tfVersion, "workspace")).ThenReturn("output", nil)
+	When(terraform.RunCommandWithVersion(ctx, tmpDir, expPlanArgs, map[string]string(nil), tfDistribution, tfVersion, "workspace")).ThenReturn("output", nil)
 
 	output, err := s.Run(ctx, []string{"extra", "args"}, tmpDir, map[string]string(nil))
 	Ok(t, err)
 
 	// Verify that env select was never called since we're in version >= 0.10
-	terraform.VerifyWasCalled(Never()).RunCommandWithVersion(ctx, tmpDir, []string{"env", "select", "workspace"}, map[string]string(nil), tfVersion, "workspace")
-	terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, tmpDir, expPlanArgs, map[string]string(nil), tfVersion, "workspace")
+	terraform.VerifyWasCalled(Never()).RunCommandWithVersion(ctx, tmpDir, []string{"env", "select", "workspace"}, map[string]string(nil), tfDistribution, tfVersion, "workspace")
+	terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, tmpDir, expPlanArgs, map[string]string(nil), tfDistribution, tfVersion, "workspace")
 	Equals(t, "output", output)
 }
 
@@ -446,13 +101,14 @@ func TestRun_UsesDiffPathForProject(t *testing.T) {
 	// Test that if running for a project, uses a different path for the plan
 	// file.
 	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
+	terraform := tfclientmocks.NewMockClient()
+	commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+	asyncTfExec := runtimemocks.NewMockAsyncTFExec()
+	mockDownloader := mocks.NewMockDownloader()
+	tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
 	tfVersion, _ := version.NewVersion("0.10.0")
 	logger := logging.NewNoopLogger(t)
-	s := runtime.PlanStepRunner{
-		TerraformExecutor: terraform,
-		DefaultTFVersion:  tfVersion,
-	}
+	s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTfExec)
 	ctx := command.ProjectContext{
 		Log:                logger,
 		Workspace:          "default",
@@ -469,7 +125,7 @@ func TestRun_UsesDiffPathForProject(t *testing.T) {
 			Name:     "repo",
 		},
 	}
-	When(terraform.RunCommandWithVersion(ctx, "/path", []string{"workspace", "show"}, map[string]string(nil), tfVersion, "workspace")).ThenReturn("workspace\n", nil)
+	When(terraform.RunCommandWithVersion(ctx, "/path", []string{"workspace", "show"}, map[string]string(nil), tfDistribution, tfVersion, "workspace")).ThenReturn("workspace\n", nil)
 
 	expPlanArgs := []string{"plan",
 		"-input=false",
@@ -491,7 +147,7 @@ func TestRun_UsesDiffPathForProject(t *testing.T) {
 		"comment",
 		"args",
 	}
-	When(terraform.RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfVersion, "default")).ThenReturn("output", nil)
+	When(terraform.RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfDistribution, tfVersion, "default")).ThenReturn("output", nil)
 
 	output, err := s.Run(ctx, []string{"extra", "args"}, "/path", map[string]string(nil))
 	Ok(t, err)
@@ -527,19 +183,21 @@ Terraform will perform the following actions:
   - aws_security_group_rule.allow_all
 `
 	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
+	terraform := tfclientmocks.NewMockClient()
+	commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+	asyncTfExec := runtimemocks.NewMockAsyncTFExec()
+	mockDownloader := mocks.NewMockDownloader()
+	tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
 	tfVersion, _ := version.NewVersion("0.10.0")
-	s := runtime.PlanStepRunner{
-		TerraformExecutor: terraform,
-		DefaultTFVersion:  tfVersion,
-	}
+	s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTfExec)
 	When(terraform.RunCommandWithVersion(
-		matchers.AnyModelsProjectCommandContext(),
-		AnyString(),
-		AnyStringSlice(),
-		matchers2.AnyMapOfStringToString(),
-		matchers2.AnyPtrToGoVersionVersion(),
-		AnyString())).
+		Any[command.ProjectContext](),
+		Any[string](),
+		Any[[]string](),
+		Any[map[string]string](),
+		Any[tf.Distribution](),
+		Any[*version.Version](),
+		Any[string]())).
 		Then(func(params []Param) ReturnValues {
 			// This code allows us to return different values depending on the
 			// tf command being run while still using the wildcard matchers above.
@@ -548,9 +206,8 @@ Terraform will perform the following actions:
 				return []ReturnValue{"default", nil}
 			} else if tfArgs[0] == "plan" {
 				return []ReturnValue{rawOutput, nil}
-			} else {
-				return []ReturnValue{"", errors.New("unexpected call to RunCommandWithVersion")}
 			}
+			return []ReturnValue{"", errors.New("unexpected call to RunCommandWithVersion")}
 		})
 	actOutput, err := s.Run(command.ProjectContext{Workspace: "default"}, nil, "", map[string]string(nil))
 	Ok(t, err)
@@ -579,21 +236,23 @@ Terraform will perform the following actions:
 // Test that even if there's an error, we get the returned output.
 func TestRun_OutputOnErr(t *testing.T) {
 	RegisterMockTestingT(t)
-	terraform := mocks.NewMockClient()
+	terraform := tfclientmocks.NewMockClient()
+	commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+	asyncTfExec := runtimemocks.NewMockAsyncTFExec()
+	mockDownloader := mocks.NewMockDownloader()
+	tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
 	tfVersion, _ := version.NewVersion("0.10.0")
-	s := runtime.PlanStepRunner{
-		TerraformExecutor: terraform,
-		DefaultTFVersion:  tfVersion,
-	}
+	s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTfExec)
 	expOutput := "expected output"
 	expErrMsg := "error!"
 	When(terraform.RunCommandWithVersion(
-		matchers.AnyModelsProjectCommandContext(),
-		AnyString(),
-		AnyStringSlice(),
-		matchers2.AnyMapOfStringToString(),
-		matchers2.AnyPtrToGoVersionVersion(),
-		AnyString())).
+		Any[command.ProjectContext](),
+		Any[string](),
+		Any[[]string](),
+		Any[map[string]string](),
+		Any[tf.Distribution](),
+		Any[*version.Version](),
+		Any[string]())).
 		Then(func(params []Param) ReturnValues {
 			// This code allows us to return different values depending on the
 			// tf command being run while still using the wildcard matchers above.
@@ -602,9 +261,8 @@ func TestRun_OutputOnErr(t *testing.T) {
 				return []ReturnValue{"default\n", nil}
 			} else if tfArgs[0] == "plan" {
 				return []ReturnValue{expOutput, errors.New(expErrMsg)}
-			} else {
-				return []ReturnValue{"", errors.New("unexpected call to RunCommandWithVersion")}
 			}
+			return []ReturnValue{"", errors.New("unexpected call to RunCommandWithVersion")}
 		})
 	actOutput, actErr := s.Run(command.ProjectContext{Workspace: "default"}, nil, "", map[string]string(nil))
 	ErrEquals(t, expErrMsg, actErr)
@@ -645,20 +303,22 @@ func TestRun_NoOptionalVarsIn012(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			terraform := mocks.NewMockClient()
+			terraform := tfclientmocks.NewMockClient()
+			commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+			asyncTfExec := runtimemocks.NewMockAsyncTFExec()
 			When(terraform.RunCommandWithVersion(
-				matchers.AnyModelsProjectCommandContext(),
-				AnyString(),
-				AnyStringSlice(),
-				matchers2.AnyMapOfStringToString(),
-				matchers2.AnyPtrToGoVersionVersion(),
-				AnyString())).ThenReturn("output", nil)
+				Any[command.ProjectContext](),
+				Any[string](),
+				Any[[]string](),
+				Any[map[string]string](),
+				Any[tf.Distribution](),
+				Any[*version.Version](),
+				Any[string]())).ThenReturn("output", nil)
 
+			mockDownloader := mocks.NewMockDownloader()
+			tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
 			tfVersion, _ := version.NewVersion(c.tfVersion)
-			s := runtime.PlanStepRunner{
-				TerraformExecutor: terraform,
-				DefaultTFVersion:  tfVersion,
-			}
+			s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTfExec)
 			ctx := command.ProjectContext{
 				Workspace:          "default",
 				RepoRelDir:         ".",
@@ -678,7 +338,7 @@ func TestRun_NoOptionalVarsIn012(t *testing.T) {
 			Ok(t, err)
 			Equals(t, "output", output)
 
-			terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfVersion, "default")
+			terraform.VerifyWasCalledOnce().RunCommandWithVersion(ctx, "/path", expPlanArgs, map[string]string(nil), tfDistribution, tfVersion, "default")
 		})
 	}
 
@@ -686,22 +346,45 @@ func TestRun_NoOptionalVarsIn012(t *testing.T) {
 
 // Test plans if using remote ops.
 func TestRun_RemoteOps(t *testing.T) {
-	cases := map[string]string{
-		"0.11.15 error": `Error: Saving a generated plan is currently not supported!
+	cases := []struct {
+		name         string
+		tfVersion    string
+		remoteOpsErr string
+	}{
+		{
+			name:      "0.11.15 error",
+			tfVersion: "0.11.15",
+			remoteOpsErr: `Error: Saving a generated plan is currently not supported!
 
 The "remote" backend does not support saving the generated execution
 plan locally at this time.
 
 `,
-		"0.12.* error": `Error: Saving a generated plan is currently not supported
+		},
+		{
+			name:      "0.12.* error",
+			tfVersion: "0.12.0",
+			remoteOpsErr: `Error: Saving a generated plan is currently not supported
 
 The "remote" backend does not support saving the generated execution plan
 locally at this time.
 
 `,
+		},
+		{
+			name:      "1.1.0 error",
+			tfVersion: "1.1.0",
+			remoteOpsErr: `╷
+│ Error: Saving a generated plan is currently not supported
+│ 
+│ Terraform Cloud does not support saving the generated execution plan
+│ locally at this time.
+╵
+`,
+		},
 	}
-	for name, remoteOpsErr := range cases {
-		t.Run(name, func(t *testing.T) {
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
 
 			logger := logging.NewNoopLogger(t)
 			// Now that mocking is set up, we're ready to run the plan.
@@ -721,19 +404,14 @@ locally at this time.
 				},
 			}
 			RegisterMockTestingT(t)
-			terraform := mocks.NewMockClient()
-
-			tfVersion, _ := version.NewVersion("0.11.12")
-			updater := mocks2.NewMockCommitStatusUpdater()
+			terraform := tfclientmocks.NewMockClient()
+			commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+			mockDownloader := mocks.NewMockDownloader()
+			tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
+			tfVersion, _ := version.NewVersion(c.tfVersion)
 			asyncTf := &remotePlanMock{}
-			s := runtime.PlanStepRunner{
-				TerraformExecutor:   terraform,
-				DefaultTFVersion:    tfVersion,
-				AsyncTFExec:         asyncTf,
-				CommitStatusUpdater: updater,
-			}
-			absProjectPath, cleanup := TempDir(t)
-			defer cleanup()
+			s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTf)
+			absProjectPath := t.TempDir()
 
 			// First, terraform workspace gets run.
 			When(terraform.RunCommandWithVersion(
@@ -741,6 +419,7 @@ locally at this time.
 				absProjectPath,
 				[]string{"workspace", "show"},
 				map[string]string(nil),
+				tfDistribution,
 				tfVersion,
 				"default")).ThenReturn("default\n", nil)
 
@@ -765,16 +444,28 @@ locally at this time.
 				"comment",
 				"args",
 			}
+			if tfVersion.GreaterThanOrEqual(version.Must(version.NewVersion("0.12.0"))) {
+				expPlanArgs = []string{"plan",
+					"-input=false",
+					"-refresh",
+					"-out",
+					fmt.Sprintf("%q", filepath.Join(absProjectPath, "default.tfplan")),
+					"extra",
+					"args",
+					"comment",
+					"args",
+				}
+			}
 
 			planErr := errors.New("exit status 1: err")
-			planOutput := "\n" + remoteOpsErr
+			planOutput := "\n" + c.remoteOpsErr
 			asyncTf.LinesToSend = remotePlanOutput
-			When(terraform.RunCommandWithVersion(ctx, absProjectPath, expPlanArgs, map[string]string(nil), tfVersion, "default")).
+			When(terraform.RunCommandWithVersion(ctx, absProjectPath, expPlanArgs, map[string]string(nil), tfDistribution, tfVersion, "default")).
 				ThenReturn(planOutput, planErr)
 
 			output, err := s.Run(ctx, []string{"extra", "args"}, absProjectPath, map[string]string(nil))
 			Ok(t, err)
-			Equals(t, `
+			Assert(t, strings.Contains(output, `
 An execution plan has been generated and is shown below.
 Resource actions are indicated with the following symbols:
 - destroy
@@ -784,31 +475,20 @@ Terraform will perform the following actions:
 - null_resource.hi[1]
 
 
-Plan: 0 to add, 0 to change, 1 to destroy.`, output)
+Plan: 0 to add, 0 to change, 1 to destroy.`), "expect plan success")
 
-			expRemotePlanArgs := []string{"plan", "-input=false", "-refresh", "extra", "args", "comment", "args"}
+			expRemotePlanArgs := []string{"plan", "-input=false", "-refresh", "-no-color", "extra", "args", "comment", "args"}
 			Equals(t, expRemotePlanArgs, asyncTf.CalledArgs)
 
 			// Verify that the fake plan file we write has the correct contents.
 			bytes, err := os.ReadFile(filepath.Join(absProjectPath, "default.tfplan"))
 			Ok(t, err)
-			Equals(t, `Atlantis: this plan was created by remote ops
-
-An execution plan has been generated and is shown below.
-Resource actions are indicated with the following symbols:
-  - destroy
-
-Terraform will perform the following actions:
-
-  - null_resource.hi[1]
-
-
-Plan: 0 to add, 0 to change, 1 to destroy.`, string(bytes))
+			Assert(t, strings.HasPrefix(string(bytes), "Atlantis: this plan was created by remote ops"), "expect remote plan")
 
 			// Ensure that the status was updated with the runURL.
 			runURL := "https://app.terraform.io/app/lkysow-enterprises/atlantis-tfe-test/runs/run-is4oVvJfrkud1KvE"
-			updater.VerifyWasCalledOnce().UpdateProject(ctx, command.Plan, models.PendingCommitStatus, runURL)
-			updater.VerifyWasCalledOnce().UpdateProject(ctx, command.Plan, models.SuccessCommitStatus, runURL)
+			commitStatusUpdater.VerifyWasCalledOnce().UpdateProject(ctx, command.Plan, models.PendingCommitStatus, runURL, nil)
+			commitStatusUpdater.VerifyWasCalledOnce().UpdateProject(ctx, command.Plan, models.SuccessCommitStatus, runURL, nil)
 		})
 	}
 }
@@ -878,6 +558,120 @@ Plan: 0 to add, 0 to change, 1 to destroy.`, output)
 	}
 }
 
+func TestPlanStepRunner_TestRun_UsesConfiguredDistribution(t *testing.T) {
+	RegisterMockTestingT(t)
+
+	expPlanArgs := []string{
+		"plan",
+		"-input=false",
+		"-refresh",
+		"-out",
+		fmt.Sprintf("%q", "/path/default.tfplan"),
+		"extra",
+		"args",
+		"comment",
+		"args",
+	}
+
+	cases := []struct {
+		name           string
+		tfVersion      string
+		tfDistribution string
+	}{
+		{
+			"stable version",
+			"0.12.0",
+			"terraform",
+		},
+		{
+			"with prerelease",
+			"0.14.0-rc1",
+			"opentofu",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			terraform := tfclientmocks.NewMockClient()
+			commitStatusUpdater := runtimemocks.NewMockStatusUpdater()
+			asyncTfExec := runtimemocks.NewMockAsyncTFExec()
+			When(terraform.RunCommandWithVersion(
+				Any[command.ProjectContext](),
+				Any[string](),
+				Any[[]string](),
+				Any[map[string]string](),
+				Any[tf.Distribution](),
+				Any[*version.Version](),
+				Any[string]())).ThenReturn("output", nil)
+
+			mockDownloader := mocks.NewMockDownloader()
+			tfDistribution := tf.NewDistributionTerraformWithDownloader(mockDownloader)
+			tfVersion, _ := version.NewVersion(c.tfVersion)
+			s := runtime.NewPlanStepRunner(terraform, tfDistribution, tfVersion, commitStatusUpdater, asyncTfExec)
+			ctx := command.ProjectContext{
+				Workspace:          "default",
+				RepoRelDir:         ".",
+				User:               models.User{Username: "username"},
+				EscapedCommentArgs: []string{"comment", "args"},
+				Pull: models.PullRequest{
+					Num: 2,
+				},
+				BaseRepo: models.Repo{
+					FullName: "owner/repo",
+					Owner:    "owner",
+					Name:     "repo",
+				},
+				TerraformDistribution: &c.tfDistribution,
+			}
+
+			output, err := s.Run(ctx, []string{"extra", "args"}, "/path", map[string]string(nil))
+			Ok(t, err)
+			Equals(t, "output", output)
+
+			terraform.VerifyWasCalledOnce().RunCommandWithVersion(Eq(ctx), Eq("/path"), Eq(expPlanArgs), Eq(map[string]string(nil)), NotEq(tfDistribution), Eq(tfVersion), Eq("default"))
+		})
+	}
+
+}
+
+func TestFilterRegexFromPlanOutput(t *testing.T) {
+	cases := []struct {
+		in             string
+		regex          *regexp.Regexp
+		expectedResult string
+	}{
+		{
+			"foobar",
+			regexp.MustCompile("f"),
+			"<redacted>oobar",
+		},
+		{
+			"foobar",
+			regexp.MustCompile("(f)"),
+			"f<redacted>oobar",
+		},
+		{
+			"foobar",
+			regexp.MustCompile("(f)oo(bar)"),
+			"f<redacted>bar",
+		},
+		{
+			remotePlanOutput,
+			nil,
+			remotePlanOutput,
+		},
+		{
+			remotePlanOutputSensitive,
+			regexp.MustCompile(`((?i)secret:\s")[^"]*`),
+			remotePlanOutputSensitiveMasked,
+		},
+	}
+	for _, c := range cases {
+		output := runtime.FilterRegexFromPlanOutput(c.in, c.regex)
+		Equals(t, c.expectedResult, output)
+	}
+}
+
 type remotePlanMock struct {
 	// LinesToSend will be sent on the channel.
 	LinesToSend string
@@ -885,12 +679,12 @@ type remotePlanMock struct {
 	CalledArgs []string
 }
 
-func (r *remotePlanMock) RunCommandAsync(ctx command.ProjectContext, path string, args []string, envs map[string]string, v *version.Version, workspace string) (chan<- string, <-chan runtimemodels.Line) {
+func (r *remotePlanMock) RunCommandAsync(_ command.ProjectContext, _ string, args []string, _ map[string]string, _ tf.Distribution, _ *version.Version, _ string) (chan<- string, <-chan runtimemodels.Line) {
 	r.CalledArgs = args
 	in := make(chan string)
 	out := make(chan runtimemodels.Line)
 	go func() {
-		for _, line := range strings.Split(r.LinesToSend, "\n") {
+		for line := range strings.SplitSeq(r.LinesToSend, "\n") {
 			out <- runtimemodels.Line{Line: line}
 		}
 		close(out)
@@ -945,3 +739,59 @@ Terraform will perform the following actions:
 
 
 Plan: 0 to add, 0 to change, 1 to destroy.`
+
+var remotePlanOutputSensitive = `Terraform will perform the following actions:
+  # kubectl_manifest.test[0] will be updated in-place
+!   resource "kubectl_manifest" "test" {
+        id                      = "/apis/argoproj.io/v1alpha1/namespaces/test/applications/test"
+        name                    = "test"
+!       yaml_body               = (sensitive value)
+!       yaml_body_parsed        = <<-EOT
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: test
+              namespace: test
+            spec:
+              destination:
+                namespace: test
+                server: https://kubernetes.default.svc
+              project: default
+              source:
+                helm:
+                  values: |-
+-                   clientID: "test_id"
+-                   clientSecret: "super_secret_old"
++                   clientID: "test_id"
++                   clientSecret: "super_secret_new"
+        EOT
+    }
+Plan: 0 to add, 1 to change, 0 to destroy.`
+
+var remotePlanOutputSensitiveMasked = `Terraform will perform the following actions:
+  # kubectl_manifest.test[0] will be updated in-place
+!   resource "kubectl_manifest" "test" {
+        id                      = "/apis/argoproj.io/v1alpha1/namespaces/test/applications/test"
+        name                    = "test"
+!       yaml_body               = (sensitive value)
+!       yaml_body_parsed        = <<-EOT
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: test
+              namespace: test
+            spec:
+              destination:
+                namespace: test
+                server: https://kubernetes.default.svc
+              project: default
+              source:
+                helm:
+                  values: |-
+-                   clientID: "test_id"
+-                   clientSecret: "<redacted>"
++                   clientID: "test_id"
++                   clientSecret: "<redacted>"
+        EOT
+    }
+Plan: 0 to add, 1 to change, 0 to destroy.`

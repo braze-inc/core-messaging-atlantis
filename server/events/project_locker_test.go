@@ -17,20 +17,22 @@ import (
 	"fmt"
 	"testing"
 
-	. "github.com/petergtz/pegomock"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/locking/mocks"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
+	"github.com/runatlantis/atlantis/server/events/vcs/github"
 	"github.com/runatlantis/atlantis/server/logging"
 	. "github.com/runatlantis/atlantis/testing"
+	"go.uber.org/mock/gomock"
 )
 
 func TestDefaultProjectLocker_TryLockWhenLocked(t *testing.T) {
-	var githubClient *vcs.GithubClient
-	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil)
-	mockLocker := mocks.NewMockLocker()
+	ctrl := gomock.NewController(t)
+	var githubClient *github.Client
+	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil, nil)
+	mockLocker := mocks.NewMockLocker(ctrl)
 	locker := events.DefaultProjectLocker{
 		Locker:    mockLocker,
 		VCSClient: mockClient,
@@ -43,7 +45,7 @@ func TestDefaultProjectLocker_TryLockWhenLocked(t *testing.T) {
 	lockingPull := models.PullRequest{
 		Num: 2,
 	}
-	When(mockLocker.TryLock(expProject, expWorkspace, expPull, expUser)).ThenReturn(
+	mockLocker.EXPECT().TryLock(expProject, expWorkspace, expPull, expUser).Return(
 		locking.TryLockResponse{
 			LockAcquired: false,
 			CurrLock: models.ProjectLock{
@@ -53,7 +55,7 @@ func TestDefaultProjectLocker_TryLockWhenLocked(t *testing.T) {
 		},
 		nil,
 	)
-	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject)
+	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, true)
 	link, _ := mockClient.MarkdownPullLink(lockingPull)
 	Ok(t, err)
 	Equals(t, &events.TryLockResponse{
@@ -63,10 +65,10 @@ func TestDefaultProjectLocker_TryLockWhenLocked(t *testing.T) {
 }
 
 func TestDefaultProjectLocker_TryLockWhenLockedSamePull(t *testing.T) {
-	RegisterMockTestingT(t)
-	var githubClient *vcs.GithubClient
-	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil)
-	mockLocker := mocks.NewMockLocker()
+	ctrl := gomock.NewController(t)
+	var githubClient *github.Client
+	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil, nil)
+	mockLocker := mocks.NewMockLocker(ctrl)
 	locker := events.DefaultProjectLocker{
 		Locker:    mockLocker,
 		VCSClient: mockClient,
@@ -80,7 +82,7 @@ func TestDefaultProjectLocker_TryLockWhenLockedSamePull(t *testing.T) {
 		Num: 2,
 	}
 	lockKey := "key"
-	When(mockLocker.TryLock(expProject, expWorkspace, expPull, expUser)).ThenReturn(
+	mockLocker.EXPECT().TryLock(expProject, expWorkspace, expPull, expUser).Return(
 		locking.TryLockResponse{
 			LockAcquired: false,
 			CurrLock: models.ProjectLock{
@@ -90,22 +92,22 @@ func TestDefaultProjectLocker_TryLockWhenLockedSamePull(t *testing.T) {
 		},
 		nil,
 	)
-	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject)
+	// Unlock will be called once when UnlockFn is invoked
+	mockLocker.EXPECT().Unlock(lockKey).Return(nil, nil)
+	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, true)
 	Ok(t, err)
 	Equals(t, true, res.LockAcquired)
 
 	// UnlockFn should work.
-	mockLocker.VerifyWasCalled(Never()).Unlock(lockKey)
 	err = res.UnlockFn()
 	Ok(t, err)
-	mockLocker.VerifyWasCalledOnce().Unlock(lockKey)
 }
 
 func TestDefaultProjectLocker_TryLockUnlocked(t *testing.T) {
-	RegisterMockTestingT(t)
-	var githubClient *vcs.GithubClient
-	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil)
-	mockLocker := mocks.NewMockLocker()
+	ctrl := gomock.NewController(t)
+	var githubClient *github.Client
+	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil, nil)
+	mockLocker := mocks.NewMockLocker(ctrl)
 	locker := events.DefaultProjectLocker{
 		Locker:    mockLocker,
 		VCSClient: mockClient,
@@ -119,7 +121,7 @@ func TestDefaultProjectLocker_TryLockUnlocked(t *testing.T) {
 		Num: 2,
 	}
 	lockKey := "key"
-	When(mockLocker.TryLock(expProject, expWorkspace, expPull, expUser)).ThenReturn(
+	mockLocker.EXPECT().TryLock(expProject, expWorkspace, expPull, expUser).Return(
 		locking.TryLockResponse{
 			LockAcquired: true,
 			CurrLock: models.ProjectLock{
@@ -129,13 +131,76 @@ func TestDefaultProjectLocker_TryLockUnlocked(t *testing.T) {
 		},
 		nil,
 	)
-	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject)
+	// Unlock will be called once when UnlockFn is invoked
+	mockLocker.EXPECT().Unlock(lockKey).Return(nil, nil)
+	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, true)
 	Ok(t, err)
 	Equals(t, true, res.LockAcquired)
 
 	// UnlockFn should work.
-	mockLocker.VerifyWasCalled(Never()).Unlock(lockKey)
 	err = res.UnlockFn()
 	Ok(t, err)
-	mockLocker.VerifyWasCalledOnce().Unlock(lockKey)
+}
+
+func TestDefaultProjectLocker_RepoLocking(t *testing.T) {
+	var githubClient *github.Client
+	mockClient := vcs.NewClientProxy(githubClient, nil, nil, nil, nil, nil)
+	expProject := models.Project{}
+	expWorkspace := "default"
+	expPull := models.PullRequest{Num: 2}
+	expUser := models.User{}
+	lockKey := "key"
+
+	tests := []struct {
+		name        string
+		repoLocking bool
+		setup       func(locker *mocks.MockLocker, noOpLocker *mocks.MockLocker)
+	}{
+		{
+			"enable repo locking",
+			true,
+			func(locker *mocks.MockLocker, noOpLocker *mocks.MockLocker) {
+				locker.EXPECT().TryLock(expProject, expWorkspace, expPull, expUser).Return(
+					locking.TryLockResponse{
+						LockAcquired: true,
+						CurrLock:     models.ProjectLock{},
+						LockKey:      lockKey,
+					},
+					nil,
+				)
+				// noOpLocker has no EXPECT — gomock will fail if it's called
+			},
+		},
+		{
+			"disable repo locking",
+			false,
+			func(locker *mocks.MockLocker, noOpLocker *mocks.MockLocker) {
+				noOpLocker.EXPECT().TryLock(expProject, expWorkspace, expPull, expUser).Return(
+					locking.TryLockResponse{
+						LockAcquired: true,
+						CurrLock:     models.ProjectLock{},
+						LockKey:      lockKey,
+					},
+					nil,
+				)
+				// locker has no EXPECT — gomock will fail if it's called
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockLocker := mocks.NewMockLocker(ctrl)
+			mockNoOpLocker := mocks.NewMockLocker(ctrl)
+			locker := events.DefaultProjectLocker{
+				Locker:     mockLocker,
+				NoOpLocker: mockNoOpLocker,
+				VCSClient:  mockClient,
+			}
+			tt.setup(mockLocker, mockNoOpLocker)
+			res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, tt.repoLocking)
+			Ok(t, err)
+			Equals(t, true, res.LockAcquired)
+		})
+	}
 }

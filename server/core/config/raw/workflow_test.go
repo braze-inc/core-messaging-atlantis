@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw_test
 
 import (
@@ -7,7 +10,6 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/raw"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	. "github.com/runatlantis/atlantis/testing"
-	yaml "gopkg.in/yaml.v2"
 )
 
 func TestWorkflow_UnmarshalYAML(t *testing.T) {
@@ -106,7 +108,7 @@ apply:
 	for _, c := range cases {
 		t.Run(c.description, func(t *testing.T) {
 			var w raw.Workflow
-			err := yaml.UnmarshalStrict([]byte(c.input), &w)
+			err := unmarshalString(c.input, &w)
 			if c.expErr != "" {
 				ErrEquals(t, c.expErr, err)
 				return
@@ -148,6 +150,8 @@ func TestWorkflow_ToValid(t *testing.T) {
 				Apply:       valid.DefaultApplyStage,
 				Plan:        valid.DefaultPlanStage,
 				PolicyCheck: valid.DefaultPolicyCheckStage,
+				Import:      valid.DefaultImportStage,
+				StateRm:     valid.DefaultStateRmStage,
 			},
 		},
 		{
@@ -174,6 +178,20 @@ func TestWorkflow_ToValid(t *testing.T) {
 						},
 					},
 				},
+				Import: &raw.Stage{
+					Steps: []raw.Step{
+						{
+							Key: String("import"),
+						},
+					},
+				},
+				StateRm: &raw.Stage{
+					Steps: []raw.Step{
+						{
+							Key: String("state_rm"),
+						},
+					},
+				},
 			},
 			exp: valid.Workflow{
 				Apply: valid.Stage{
@@ -194,6 +212,20 @@ func TestWorkflow_ToValid(t *testing.T) {
 					Steps: []valid.Step{
 						{
 							StepName: "init",
+						},
+					},
+				},
+				Import: valid.Stage{
+					Steps: []valid.Step{
+						{
+							StepName: "import",
+						},
+					},
+				},
+				StateRm: valid.Stage{
+					Steps: []valid.Step{
+						{
+							StepName: "state_rm",
 						},
 					},
 				},

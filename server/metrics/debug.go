@@ -1,10 +1,13 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package metrics
 
 import (
 	"time"
 
 	"github.com/runatlantis/atlantis/server/logging"
-	"github.com/uber-go/tally"
+	tally "github.com/uber-go/tally/v4"
 )
 
 // newLoggingReporter returns a tally reporter that logs to the provided logger at debug level. This is useful for
