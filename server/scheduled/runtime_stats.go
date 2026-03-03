@@ -1,9 +1,12 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package scheduled
 
 import (
 	"runtime"
 
-	"github.com/uber-go/tally"
+	tally "github.com/uber-go/tally/v4"
 )
 
 type RuntimeStatCollector struct {

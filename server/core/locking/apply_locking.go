@@ -1,13 +1,17 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package locking
 
 import (
 	"errors"
 	"time"
 
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/events/command"
 )
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_apply_lock_checker.go ApplyLockChecker
+//go:generate mockgen -package mocks -destination mocks/mock_apply_lock_checker.go . ApplyLockChecker
 
 // ApplyLockChecker is an implementation of the global apply lock retrieval.
 // It returns an object that contains information about apply locks status.
@@ -15,7 +19,7 @@ type ApplyLockChecker interface {
 	CheckApplyLock() (ApplyCommandLock, error)
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_apply_locker.go ApplyLocker
+//go:generate mockgen -package mocks -destination mocks/mock_apply_locker.go . ApplyLocker
 
 // ApplyLocker interface that manages locks for apply command runner
 type ApplyLocker interface {
@@ -31,36 +35,39 @@ type ApplyLocker interface {
 // ApplyCommandLock contains information about apply command lock status.
 type ApplyCommandLock struct {
 	// Locked is true is when apply commands are locked
-	// Either by using DisableApply flag or creating a global ApplyCommandLock
+	// Either by using omitting apply from AllowCommands or creating a global ApplyCommandLock
 	// DisableApply lock take precedence when set
-	Locked  bool
-	Time    time.Time
-	Failure string
+	Locked                 bool
+	GlobalApplyLockEnabled bool
+	Time                   time.Time
+	Failure                string
 }
 
 type ApplyClient struct {
-	backend          Backend
-	disableApplyFlag bool
+	database               db.Database
+	disableApply           bool
+	disableGlobalApplyLock bool
 }
 
-func NewApplyClient(backend Backend, disableApplyFlag bool) ApplyLocker {
+func NewApplyClient(database db.Database, disableApply bool, disableGlobalApplyLock bool) ApplyLocker {
 	return &ApplyClient{
-		backend:          backend,
-		disableApplyFlag: disableApplyFlag,
+		database:               database,
+		disableApply:           disableApply,
+		disableGlobalApplyLock: disableGlobalApplyLock,
 	}
 }
 
 // LockApply acquires global apply lock.
-// DisableApplyFlag takes presedence to any existing locks, if it is set to true
+// DisableApply takes precedence to any existing locks, if it is set to true
 // this function returns an error
 func (c *ApplyClient) LockApply() (ApplyCommandLock, error) {
 	response := ApplyCommandLock{}
 
-	if c.disableApplyFlag {
-		return response, errors.New("DisableApplyFlag is set; Apply commands are locked globally until flag is unset")
+	if c.disableApply {
+		return response, errors.New("apply is omitted from AllowCommands; Apply commands are locked globally until flag is updated")
 	}
 
-	applyCmdLock, err := c.backend.LockCommand(command.Apply, time.Now())
+	applyCmdLock, err := c.database.LockCommand(command.Apply, time.Now())
 	if err != nil {
 		return response, err
 	}
@@ -73,14 +80,14 @@ func (c *ApplyClient) LockApply() (ApplyCommandLock, error) {
 }
 
 // UnlockApply releases a global apply lock.
-// DisableApplyFlag takes presedence to any existing locks, if it is set to true
+// DisableApply takes precedence to any existing locks, if it is set to true
 // this function returns an error
 func (c *ApplyClient) UnlockApply() error {
-	if c.disableApplyFlag {
-		return errors.New("apply commands are disabled until DisableApply flag is unset")
+	if c.disableApply {
+		return errors.New("apply commands are disabled until AllowCommands flag is updated")
 	}
 
-	err := c.backend.UnlockCommand(command.Apply)
+	err := c.database.UnlockCommand(command.Apply)
 	if err != nil {
 		return err
 	}
@@ -89,17 +96,19 @@ func (c *ApplyClient) UnlockApply() error {
 }
 
 // CheckApplyLock retrieves an apply command lock if present.
-// If DisableApplyFlag is set it will always return a lock.
+// If DisableApply is set it will always return a lock.
 func (c *ApplyClient) CheckApplyLock() (ApplyCommandLock, error) {
-	response := ApplyCommandLock{}
+	response := ApplyCommandLock{
+		GlobalApplyLockEnabled: true,
+	}
 
-	if c.disableApplyFlag {
+	if c.disableApply {
 		return ApplyCommandLock{
 			Locked: true,
 		}, nil
 	}
 
-	applyCmdLock, err := c.backend.CheckCommandLock(command.Apply)
+	applyCmdLock, err := c.database.CheckCommandLock(command.Apply)
 	if err != nil {
 		return response, err
 	}
@@ -107,6 +116,9 @@ func (c *ApplyClient) CheckApplyLock() (ApplyCommandLock, error) {
 	if applyCmdLock != nil {
 		response.Locked = true
 		response.Time = applyCmdLock.LockTime()
+	}
+	if c.disableGlobalApplyLock {
+		response.GlobalApplyLockEnabled = false
 	}
 
 	return response, nil

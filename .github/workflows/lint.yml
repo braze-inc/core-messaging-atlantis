@@ -1,47 +1,84 @@
 name: linter
 
-on: [pull_request]
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    branches:
+      - "main"
+      - "release-**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+permissions:
+  # Required: allow read access to the content for analysis.
+  contents: read
+  # Optional: allow read access to pull request. Use with `only-new-issues` option.
+  pull-requests: read
+  # Optional: Allow write access to checks to allow the action to annotate code in the PR.
+  checks: write
+
 jobs:
+  changes:
+    outputs:
+      should-run-linting: ${{ steps.changes.outputs.go == 'true' }}
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
+        id: changes
+        with:
+          filters: |
+            go:
+              - '**.go'
+              - 'go.*'
+              - '.github/workflows/lint.yml'
+              - '.golangci.yml'
+
   golangci-lint:
-    name: runner / golangci-lint
-    runs-on: ubuntu-latest
+    needs: [changes]
+    if: github.event.pull_request.draft == false && needs.changes.outputs.should-run-linting == 'true'
+    name: Linting
+    runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v3
-    - name: golangci-lint
-      uses: reviewdog/action-golangci-lint@v2
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        tool_name: golangci-lint
-
-  # Use revive via golangci-lint binary with "warning" level.
-  revive:
-    name: runner / revive
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v3
-      - name: revive
-        uses: reviewdog/action-golangci-lint@v2
+      - name: Harden Runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
         with:
-          golangci_lint_flags: "--disable-all -E revive"
-          tool_name: revive # Change reporter name.
-          level: warning # GitHub Status Check won't become failure with this level.
+          egress-policy: audit
 
-  # You can add more and more supported linters with different config.
-  errcheck:
-    name: runner / errcheck
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v3
-      - name: errcheck
-        uses: reviewdog/action-golangci-lint@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # need to setup go toolchain explicitly
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          golangci_lint_flags: "--disable-all -E errcheck"
-          tool_name: errcheck
-          level: info
+          go-version-file: go.mod
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
+        with:
+          # renovate: datasource=github-releases depName=golangci/golangci-lint
+          version: v2.7.2
+
+  skip-lint:
+    needs: [changes]
+    if: needs.changes.outputs.should-run-linting == 'false'
+    name: Linting
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: audit
+
+      - run: 'echo "No build required"'

@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package models
 
 import (
@@ -5,7 +8,7 @@ import (
 	"path/filepath"
 )
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_filepath.go FilePath
+//go:generate pegomock generate --package mocks -o mocks/mock_filepath.go FilePath
 
 type FilePath interface {
 	NotExists() bool

@@ -20,12 +20,12 @@ import (
 	"io"
 	"net/http"
 
-	gitlab "github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
 const secretHeader = "X-Gitlab-Token" // #nosec
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_gitlab_request_parser_validator.go GitlabRequestParserValidator
+//go:generate pegomock generate --package mocks -o mocks/mock_gitlab_request_parser_validator.go GitlabRequestParserValidator
 
 // GitlabRequestParserValidator parses and validates GitLab requests.
 type GitlabRequestParserValidator interface {
@@ -48,7 +48,7 @@ type GitlabRequestParserValidator interface {
 	//	default:
 	//		// unsupported event
 	//	}
-	ParseAndValidate(r *http.Request, secret []byte) (interface{}, error)
+	ParseAndValidate(r *http.Request, secret []byte) (any, error)
 }
 
 // DefaultGitlabRequestParserValidator parses and validates GitLab requests.
@@ -56,7 +56,7 @@ type DefaultGitlabRequestParserValidator struct{}
 
 // ParseAndValidate returns the JSON payload of the request.
 // See GitlabRequestParserValidator.ParseAndValidate().
-func (d *DefaultGitlabRequestParserValidator) ParseAndValidate(r *http.Request, secret []byte) (interface{}, error) {
+func (d *DefaultGitlabRequestParserValidator) ParseAndValidate(r *http.Request, secret []byte) (any, error) {
 	const mergeEventHeader = "Merge Request Hook"
 	const noteEventHeader = "Note Hook"
 

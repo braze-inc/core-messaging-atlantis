@@ -1,11 +1,19 @@
 module github.com/runatlantis/atlantis/e2e
 
-go 1.17
+go 1.25.4
 
 require (
-	github.com/google/go-github/v28 v28.0.0
-	github.com/google/go-querystring v1.0.0 // indirect
-	github.com/hashicorp/errwrap v1.0.0 // indirect
-	github.com/hashicorp/go-multierror v1.0.0
-	golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2 // indirect
+	github.com/google/go-github/v83 v83.0.0
+	github.com/hashicorp/go-multierror v1.1.1
+	gitlab.com/gitlab-org/api/client-go v0.118.0
+)
+
+require (
+	github.com/google/go-querystring v1.2.0 // indirect
+	github.com/hashicorp/errwrap v1.1.0 // indirect
+	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
+	github.com/hashicorp/go-retryablehttp v0.7.7 // indirect
+	golang.org/x/oauth2 v0.27.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/time v0.3.0 // indirect
 )

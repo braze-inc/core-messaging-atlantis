@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package controllers
 
 import (
@@ -6,12 +9,12 @@ import (
 	"net/url"
 
 	"github.com/gorilla/mux"
-	"github.com/runatlantis/atlantis/server/controllers/templates"
+	"github.com/runatlantis/atlantis/server/controllers/web_templates"
 	"github.com/runatlantis/atlantis/server/controllers/websocket"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/metrics"
-	"github.com/uber-go/tally"
+	tally "github.com/uber-go/tally/v4"
 )
 
 type JobIDKeyGenerator struct{}
@@ -26,26 +29,26 @@ func (g JobIDKeyGenerator) Generate(r *http.Request) (string, error) {
 }
 
 type JobsController struct {
-	AtlantisVersion          string
-	AtlantisURL              *url.URL
-	Logger                   logging.SimpleLogging
-	ProjectJobsTemplate      templates.TemplateWriter
-	ProjectJobsErrorTemplate templates.TemplateWriter
-	Db                       *db.BoltDB
-	WsMux                    *websocket.Multiplexor
+	AtlantisVersion          string                       `validate:"required"`
+	AtlantisURL              *url.URL                     `validate:"required"`
+	Logger                   logging.SimpleLogging        `validate:"required"`
+	ProjectJobsTemplate      web_templates.TemplateWriter `validate:"required"`
+	ProjectJobsErrorTemplate web_templates.TemplateWriter `validate:"required"`
+	Database                 db.Database                  `validate:"required"`
+	WsMux                    *websocket.Multiplexor       `validate:"required"`
 	KeyGenerator             JobIDKeyGenerator
-	StatsScope               tally.Scope
+	StatsScope               tally.Scope `validate:"required"`
 }
 
 func (j *JobsController) getProjectJobs(w http.ResponseWriter, r *http.Request) error {
 	jobID, err := j.KeyGenerator.Generate(r)
 
 	if err != nil {
-		j.respond(w, logging.Error, http.StatusBadRequest, err.Error())
+		j.respond(w, logging.Error, http.StatusBadRequest, "%s", err.Error())
 		return err
 	}
 
-	viewData := templates.ProjectJobData{
+	viewData := web_templates.ProjectJobData{
 		AtlantisVersion: j.AtlantisVersion,
 		ProjectPath:     jobID,
 		CleanedBasePath: j.AtlantisURL.Path,
@@ -67,7 +70,7 @@ func (j *JobsController) getProjectJobsWS(w http.ResponseWriter, r *http.Request
 	err := j.WsMux.Handle(w, r)
 
 	if err != nil {
-		j.respond(w, logging.Error, http.StatusInternalServerError, err.Error())
+		j.respond(w, logging.Error, http.StatusInternalServerError, "%s", err.Error())
 		return err
 	}
 
@@ -87,7 +90,7 @@ func (j *JobsController) GetProjectJobsWS(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (j *JobsController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...interface{}) {
+func (j *JobsController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...any) {
 	response := fmt.Sprintf(format, args...)
 	j.Logger.Log(lvl, response)
 	w.WriteHeader(responseCode)

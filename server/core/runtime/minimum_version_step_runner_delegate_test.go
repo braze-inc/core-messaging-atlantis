@@ -1,10 +1,13 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package runtime
 
 import (
 	"testing"
 
 	"github.com/hashicorp/go-version"
-	. "github.com/petergtz/pegomock"
+	. "github.com/petergtz/pegomock/v4"
 	"github.com/runatlantis/atlantis/server/core/runtime/mocks"
 	"github.com/runatlantis/atlantis/server/events/command"
 	. "github.com/runatlantis/atlantis/testing"
@@ -26,7 +29,7 @@ func TestRunMinimumVersionDelegate(t *testing.T) {
 	expectedOut := "some valid output from delegate"
 
 	t.Run("default version success", func(t *testing.T) {
-		subject := &MinimumVersionStepRunnerDelegate{
+		subject := &minimumVersionStepRunnerDelegate{
 			defaultTfVersion: tfVersion12,
 			minimumVersion:   tfVersion12,
 			delegate:         mockDelegate,
@@ -48,7 +51,7 @@ func TestRunMinimumVersionDelegate(t *testing.T) {
 	})
 
 	t.Run("ctx version success", func(t *testing.T) {
-		subject := &MinimumVersionStepRunnerDelegate{
+		subject := &minimumVersionStepRunnerDelegate{
 			defaultTfVersion: tfVersion11,
 			minimumVersion:   tfVersion12,
 			delegate:         mockDelegate,
@@ -72,7 +75,7 @@ func TestRunMinimumVersionDelegate(t *testing.T) {
 	})
 
 	t.Run("default version failure", func(t *testing.T) {
-		subject := &MinimumVersionStepRunnerDelegate{
+		subject := &minimumVersionStepRunnerDelegate{
 			defaultTfVersion: tfVersion11,
 			minimumVersion:   tfVersion12,
 			delegate:         mockDelegate,
@@ -94,7 +97,7 @@ func TestRunMinimumVersionDelegate(t *testing.T) {
 	})
 
 	t.Run("ctx version failure", func(t *testing.T) {
-		subject := &MinimumVersionStepRunnerDelegate{
+		subject := &minimumVersionStepRunnerDelegate{
 			defaultTfVersion: tfVersion12,
 			minimumVersion:   tfVersion12,
 			delegate:         mockDelegate,

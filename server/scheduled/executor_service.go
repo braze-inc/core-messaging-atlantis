@@ -1,21 +1,25 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package scheduled
 
 import (
 	"context"
-	"github.com/runatlantis/atlantis/server/logging"
-	"github.com/uber-go/tally"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/runatlantis/atlantis/server/logging"
+	tally "github.com/uber-go/tally/v4"
 )
 
 type ExecutorService struct {
 	log logging.SimpleLogging
 
 	// jobs
-	runtimeStatsPublisher JobDefinition
+	jobs []JobDefinition
 }
 
 func NewExecutorService(
@@ -32,9 +36,13 @@ func NewExecutorService(
 	}
 
 	return &ExecutorService{
-		log:                   log,
-		runtimeStatsPublisher: runtimeStatsPublisherJob,
+		log:  log,
+		jobs: []JobDefinition{runtimeStatsPublisherJob},
 	}
+}
+
+func (s *ExecutorService) AddJob(jd JobDefinition) {
+	s.jobs = append(s.jobs, jd)
 }
 
 type JobDefinition struct {
@@ -49,7 +57,9 @@ func (s *ExecutorService) Run() {
 
 	var wg sync.WaitGroup
 
-	s.runScheduledJob(ctx, &wg, s.runtimeStatsPublisher)
+	for _, jd := range s.jobs {
+		s.runScheduledJob(ctx, &wg, jd)
+	}
 
 	interrupt := make(chan os.Signal, 1)
 
@@ -68,10 +78,8 @@ func (s *ExecutorService) Run() {
 
 func (s *ExecutorService) runScheduledJob(ctx context.Context, wg *sync.WaitGroup, jd JobDefinition) {
 	ticker := time.NewTicker(jd.Period)
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		defer ticker.Stop()
 
 		// Ensure we recover from any panics to keep the jobs isolated.
@@ -91,10 +99,11 @@ func (s *ExecutorService) runScheduledJob(ctx context.Context, wg *sync.WaitGrou
 				jd.Job.Run()
 			}
 		}
-	}()
+	})
 
 }
 
+//go:generate pegomock generate --package mocks -o mocks/mock_executor_service_job.go Job
 type Job interface {
 	Run()
 }

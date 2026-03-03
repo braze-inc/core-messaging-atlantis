@@ -3,7 +3,9 @@
 // Licensed under the Apache License, Version 2.0 (the License);
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-//    http://www.apache.org/licenses/LICENSE-2.0
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an AS IS BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -29,9 +31,8 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
-	"github.com/google/go-github/v31/github"
+	"github.com/google/go-github/v83/github"
 	"github.com/mitchellh/colorstring"
-	"github.com/pkg/errors"
 )
 
 var terraformExampleRepoOwner = "runatlantis"
@@ -46,7 +47,7 @@ This mode sets up Atlantis on a test repo so you can try it out. We will
 
 [bold]Press Ctrl-c at any time to exit
 `
-var pullRequestBody = strings.Replace(`
+var pullRequestBody = strings.ReplaceAll(`
 In this pull request we will learn how to use Atlantis.
 
 1. In a couple of seconds you should see the output of Atlantis automatically running $terraform plan$.
@@ -76,11 +77,11 @@ In this pull request we will learn how to use Atlantis.
     $$$
     atlantis apply
     $$$
-    **NOTE:** Because this example isn't using [remote state storage](https://www.terraform.io/docs/state/remote.html) the state will be lost once the pull request is merged. To use Atlantis properly, you **must** be using remote state.
+    **NOTE:** Because this example isn't using [remote state storage](https://developer.hashicorp.com/terraform/language/state/remote) the state will be lost once the pull request is merged. To use Atlantis properly, you **must** be using remote state.
 
 1. Finally, merge the pull request to unlock this directory.
 
-Thank you for trying out Atlantis! Next, try using Atlantis on your own repositories: [www.runatlantis.io/guide/getting-started.html](https://www.runatlantis.io/guide/getting-started.html).`, "$", "`", -1)
+Thank you for trying out Atlantis! Next, try using Atlantis on your own repositories: [www.runatlantis.io/guide/getting-started.html](https://www.runatlantis.io/guide/getting-started.html).`, "$", "`")
 
 // Start begins the testdrive process.
 // nolint: errcheck
@@ -97,7 +98,7 @@ To continue, we need you to create a GitHub personal access token
 with [green]"repo" [reset]scope so we can fork an example terraform project.
 
 Follow these instructions to create a token (we don't store any tokens):
-[green]https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token#creating-a-token[reset]
+[green]https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token#creating-a-fine-grained-personal-access-token[reset]
 - use "atlantis" for the token description
 - add "repo" scope
 - copy the access token
@@ -115,10 +116,10 @@ Follow these instructions to create a token (we don't store any tokens):
 	colorstring.Println("\n=> forking repo ")
 	s.Start()
 	if err := githubClient.CreateFork(terraformExampleRepoOwner, terraformExampleRepo); err != nil {
-		return errors.Wrapf(err, "forking repo %s/%s", terraformExampleRepoOwner, terraformExampleRepo)
+		return fmt.Errorf("forking repo %s/%s: %w", terraformExampleRepoOwner, terraformExampleRepo, err)
 	}
 	if !githubClient.CheckForkSuccess(terraformExampleRepoOwner, terraformExampleRepo) {
-		return fmt.Errorf("didn't find forked repo %s/%s. fork unsuccessful", terraformExampleRepoOwner, terraformExampleRepoOwner)
+		return fmt.Errorf("didn't find forked repo %s/%s. fork unsuccessful", terraformExampleRepoOwner, terraformExampleRepo)
 	}
 	s.Stop()
 	colorstring.Println("[green]=> fork completed![reset]")
@@ -131,14 +132,14 @@ Follow these instructions to create a token (we don't store any tokens):
 		s.Start()
 		terraformDownloadURL := fmt.Sprintf("%s/terraform/%s/terraform_%s_%s_%s.zip", hashicorpReleasesURL, terraformVersion, terraformVersion, runtime.GOOS, runtime.GOARCH)
 		if err = downloadAndUnzip(terraformDownloadURL, "/tmp/terraform.zip", "/tmp"); err != nil {
-			return errors.Wrapf(err, "downloading and unzipping terraform")
+			return fmt.Errorf("downloading and unzipping terraform: %w", err)
 		}
 		colorstring.Println("[green]=> downloaded terraform successfully![reset]")
 		s.Stop()
 
 		err = executeCmd("mv", "/tmp/terraform", "/usr/local/bin/")
 		if err != nil {
-			return errors.Wrapf(err, "moving terraform binary into /usr/local/bin")
+			return fmt.Errorf("moving terraform binary into /usr/local/bin: %w", err)
 		}
 		colorstring.Println("[green]=> installed terraform successfully at /usr/local/bin[reset]")
 	} else {
@@ -153,7 +154,7 @@ Follow these instructions to create a token (we don't store any tokens):
 		s.Start()
 		ngrokURL := fmt.Sprintf("%s/ngrok-stable-%s-%s.zip", ngrokDownloadURL, runtime.GOOS, runtime.GOARCH)
 		if err = downloadAndUnzip(ngrokURL, "/tmp/ngrok.zip", "/tmp"); err != nil {
-			return errors.Wrapf(err, "downloading and unzipping ngrok")
+			return fmt.Errorf("downloading and unzipping ngrok: %w", err)
 		}
 		s.Stop()
 		colorstring.Println("[green]=> downloaded ngrok successfully![reset]")
@@ -171,6 +172,7 @@ Follow these instructions to create a token (we don't store any tokens):
 	// will just choose a random API port and we won't be able to get the right
 	// url.
 	ngrokConfig := fmt.Sprintf(`
+version: 1
 web_addr: %s
 tunnels:
   atlantis:
@@ -179,13 +181,13 @@ tunnels:
     proto: http
 `, ngrokAPIURL, atlantisPort)
 
-	ngrokConfigFile, err := os.CreateTemp("", "")
+	ngrokConfigFile, err := os.CreateTemp("", "atlantis-testdrive-ngrok-config")
 	if err != nil {
-		return errors.Wrap(err, "creating ngrok config file")
+		return fmt.Errorf("creating ngrok config file: %w", err)
 	}
 	err = os.WriteFile(ngrokConfigFile.Name(), []byte(ngrokConfig), 0600)
 	if err != nil {
-		return errors.Wrap(err, "writing ngrok config file")
+		return fmt.Errorf("writing ngrok config file: %w", err)
 	}
 
 	// Used to ensure proper termination of all background commands.
@@ -199,7 +201,7 @@ tunnels:
 	// Check if we got a fast error. Move on if we haven't (the command is still running).
 	if err != nil {
 		s.Stop()
-		return errors.Wrap(err, "creating ngrok tunnel")
+		return fmt.Errorf("creating ngrok tunnel: %w", err)
 	}
 	// When this function returns, ngrok tunnel should be stopped.
 	defer cancelNgrok()
@@ -211,7 +213,7 @@ tunnels:
 	time.Sleep(1 * time.Second)
 	tunnelURL, err := getTunnelAddr()
 	if err != nil {
-		return errors.Wrapf(err, "getting tunnel url")
+		return fmt.Errorf("getting tunnel url: %w", err)
 	}
 
 	// Start atlantis server.
@@ -219,7 +221,7 @@ tunnels:
 	s.Start()
 	tmpDir, err := os.MkdirTemp("", "")
 	if err != nil {
-		return errors.Wrap(err, "creating a temporary data directory for Atlantis")
+		return fmt.Errorf("creating a temporary data directory for Atlantis: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 	serverReadyLog := regexp.MustCompile("Atlantis started - listening on port 4141")
@@ -228,7 +230,7 @@ tunnels:
 		os.Args[0], "server", "--gh-user", githubUsername, "--gh-token", githubToken, "--data-dir", tmpDir, "--atlantis-url", tunnelURL, "--repo-allowlist", fmt.Sprintf("github.com/%s/%s", githubUsername, terraformExampleRepo))
 	// Check if we got a fast error. Move on if we haven't (the command is still running).
 	if err != nil {
-		return errors.Wrap(err, "creating atlantis server")
+		return fmt.Errorf("creating atlantis server: %w", err)
 	}
 	// When this function returns atlantis server should be stopped.
 	defer cancelAtlantis()
@@ -241,7 +243,7 @@ tunnels:
 	s.Start()
 	err = githubClient.CreateWebhook(githubUsername, terraformExampleRepo, fmt.Sprintf("%s/events", tunnelURL))
 	if err != nil {
-		return errors.Wrapf(err, "creating atlantis webhook")
+		return fmt.Errorf("creating atlantis webhook: %w", err)
 	}
 	s.Stop()
 	colorstring.Println("[green]=> atlantis webhook created![reset]")
@@ -249,9 +251,9 @@ tunnels:
 	// Create a new pr in the example repo.
 	colorstring.Println("=> creating a new pull request")
 	s.Start()
-	pullRequestURL, err := githubClient.CreatePullRequest(githubUsername, terraformExampleRepo, "example", "master")
+	pullRequestURL, err := githubClient.CreatePullRequest(githubUsername, terraformExampleRepo, "example", "main")
 	if err != nil {
-		return errors.Wrapf(err, "creating new pull request for repo %s/%s", githubUsername, terraformExampleRepo)
+		return fmt.Errorf("creating new pull request for repo %s/%s: %w", githubUsername, terraformExampleRepo, err)
 	}
 	s.Stop()
 	colorstring.Println("[green]=> pull request created![reset]")
@@ -283,8 +285,14 @@ tunnels:
 		colorstring.Println("\n[green]Thank you for using atlantis :) \n[reset]For more information about how to use atlantis in production go to: https://www.runatlantis.io")
 		return nil
 	case err := <-ngrokErrors:
-		return errors.Wrap(err, "ngrok tunnel")
+		if err != nil {
+			err = fmt.Errorf("ngrok tunnel: %w", err)
+		}
+		return err
 	case err := <-atlantisErrors:
-		return errors.Wrap(err, "atlantis server")
+		if err != nil {
+			err = fmt.Errorf("atlantis server: %w", err)
+		}
+		return err
 	}
 }

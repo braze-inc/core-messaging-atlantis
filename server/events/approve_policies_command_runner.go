@@ -1,10 +1,12 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events
 
 import (
-	"fmt"
-
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/events/vcs"
 )
 
 func NewApprovePoliciesCommandRunner(
@@ -15,6 +17,7 @@ func NewApprovePoliciesCommandRunner(
 	dbUpdater *DBUpdater,
 	SilenceNoProjects bool,
 	silenceVCSStatusNoProjects bool,
+	vcsClient vcs.Client,
 ) *ApprovePoliciesCommandRunner {
 	return &ApprovePoliciesCommandRunner{
 		commitStatusUpdater:        commitStatusUpdater,
@@ -24,6 +27,7 @@ func NewApprovePoliciesCommandRunner(
 		dbUpdater:                  dbUpdater,
 		SilenceNoProjects:          SilenceNoProjects,
 		silenceVCSStatusNoProjects: silenceVCSStatusNoProjects,
+		vcsClient:                  vcsClient,
 	}
 }
 
@@ -37,19 +41,20 @@ type ApprovePoliciesCommandRunner struct {
 	// are found
 	SilenceNoProjects          bool
 	silenceVCSStatusNoProjects bool
+	vcsClient                  vcs.Client
 }
 
 func (a *ApprovePoliciesCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	baseRepo := ctx.Pull.BaseRepo
 	pull := ctx.Pull
 
-	if err := a.commitStatusUpdater.UpdateCombined(baseRepo, pull, models.PendingCommitStatus, command.PolicyCheck); err != nil {
+	if err := a.commitStatusUpdater.UpdateCombined(ctx.Log, baseRepo, pull, models.PendingCommitStatus, command.PolicyCheck); err != nil {
 		ctx.Log.Warn("unable to update commit status: %s", err)
 	}
 
 	projectCmds, err := a.prjCmdBuilder.BuildApprovePoliciesCommands(ctx, cmd)
 	if err != nil {
-		if statusErr := a.commitStatusUpdater.UpdateCombined(ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, command.PolicyCheck); statusErr != nil {
+		if statusErr := a.commitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, command.PolicyCheck); statusErr != nil {
 			ctx.Log.Warn("unable to update commit status: %s", statusErr)
 		}
 		a.pullUpdater.updatePull(ctx, cmd, command.Result{Error: err})
@@ -63,14 +68,14 @@ func (a *ApprovePoliciesCommandRunner) Run(ctx *command.Context, cmd *CommentCom
 			// with 0/0 projects approve_policies successfully because some users require
 			// the Atlantis status to be passing for all pull requests.
 			ctx.Log.Debug("setting VCS status to success with no projects found")
-			if err := a.commitStatusUpdater.UpdateCombinedCount(ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.PolicyCheck, 0, 0); err != nil {
+			if err := a.commitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.PolicyCheck, 0, 0); err != nil {
 				ctx.Log.Warn("unable to update commit status: %s", err)
 			}
 		}
 		return
 	}
 
-	result := a.buildApprovePolicyCommandResults(ctx, projectCmds)
+	result := runProjectCmds(projectCmds, a.prjCmdRunner.ApprovePolicies)
 
 	a.pullUpdater.updatePull(
 		ctx,
@@ -87,25 +92,6 @@ func (a *ApprovePoliciesCommandRunner) Run(ctx *command.Context, cmd *CommentCom
 	a.updateCommitStatus(ctx, pullStatus)
 }
 
-func (a *ApprovePoliciesCommandRunner) buildApprovePolicyCommandResults(ctx *command.Context, prjCmds []command.ProjectContext) (result command.Result) {
-	// Check if vcs user is in the owner list of the PolicySets. All projects
-	// share the same Owners list at this time so no reason to iterate over each
-	// project.
-	if len(prjCmds) > 0 && !prjCmds[0].PolicySets.IsOwner(ctx.User.Username) {
-		result.Error = fmt.Errorf("contact policy owners to approve failing policies")
-		return
-	}
-
-	var prjResults []command.ProjectResult
-
-	for _, prjCmd := range prjCmds {
-		prjResult := a.prjCmdRunner.ApprovePolicies(prjCmd)
-		prjResults = append(prjResults, prjResult)
-	}
-	result.ProjectResults = prjResults
-	return
-}
-
 func (a *ApprovePoliciesCommandRunner) updateCommitStatus(ctx *command.Context, pullStatus models.PullStatus) {
 	var numSuccess int
 	var numErrored int
@@ -118,7 +104,7 @@ func (a *ApprovePoliciesCommandRunner) updateCommitStatus(ctx *command.Context, 
 		status = models.FailedCommitStatus
 	}
 
-	if err := a.commitStatusUpdater.UpdateCombinedCount(ctx.Pull.BaseRepo, ctx.Pull, status, command.PolicyCheck, numSuccess, len(pullStatus.Projects)); err != nil {
+	if err := a.commitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, status, command.PolicyCheck, numSuccess, len(pullStatus.Projects)); err != nil {
 		ctx.Log.Warn("unable to update commit status: %s", err)
 	}
 }

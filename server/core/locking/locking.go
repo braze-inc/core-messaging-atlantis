@@ -3,7 +3,9 @@
 // Licensed under the Apache License, Version 2.0 (the License);
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-//    http://www.apache.org/licenses/LICENSE-2.0
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an AS IS BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,28 +18,12 @@ package locking
 
 import (
 	"errors"
-	"fmt"
 	"regexp"
 	"time"
 
-	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/events/models"
 )
-
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_backend.go Backend
-
-// Backend is an implementation of the locking API we require.
-type Backend interface {
-	TryLock(lock models.ProjectLock) (bool, models.ProjectLock, error)
-	Unlock(project models.Project, workspace string) (*models.ProjectLock, error)
-	List() ([]models.ProjectLock, error)
-	GetLock(project models.Project, workspace string) (*models.ProjectLock, error)
-	UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error)
-
-	LockCommand(cmdName command.Name, lockTime time.Time) (*command.Lock, error)
-	UnlockCommand(cmdName command.Name) error
-	CheckCommandLock(cmdName command.Name) (*command.Lock, error)
-}
 
 // TryLockResponse results from an attempted lock.
 type TryLockResponse struct {
@@ -51,10 +37,10 @@ type TryLockResponse struct {
 
 // Client is used to perform locking actions.
 type Client struct {
-	backend Backend
+	database db.Database
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_locker.go Locker
+//go:generate mockgen -package mocks -destination mocks/mock_locker.go . Locker
 
 type Locker interface {
 	TryLock(p models.Project, workspace string, pull models.PullRequest, user models.User) (TryLockResponse, error)
@@ -65,14 +51,14 @@ type Locker interface {
 }
 
 // NewClient returns a new locking client.
-func NewClient(backend Backend) *Client {
+func NewClient(database db.Database) *Client {
 	return &Client{
-		backend: backend,
+		database: database,
 	}
 }
 
-// keyRegex matches and captures {repoFullName}/{path}/{workspace} where path can have multiple /'s in it.
-var keyRegex = regexp.MustCompile(`^(.*?\/.*?)\/(.*)\/(.*)$`)
+// keyRegex matches and captures {repoFullName}/{path}/{workspace}/{projectName} where path can have multiple /'s in it.
+var keyRegex = regexp.MustCompile(`^(.*?\/.*?)\/(.*)\/(.*)\/(.*)$`)
 
 // TryLock attempts to acquire a lock to a project and workspace.
 func (c *Client) TryLock(p models.Project, workspace string, pull models.PullRequest, user models.User) (TryLockResponse, error) {
@@ -83,7 +69,7 @@ func (c *Client) TryLock(p models.Project, workspace string, pull models.PullReq
 		User:      user,
 		Pull:      pull,
 	}
-	lockAcquired, currLock, err := c.backend.TryLock(lock)
+	lockAcquired, currLock, err := c.database.TryLock(lock)
 	if err != nil {
 		return TryLockResponse{}, err
 	}
@@ -99,14 +85,14 @@ func (c *Client) Unlock(key string) (*models.ProjectLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.backend.Unlock(project, workspace)
+	return c.database.Unlock(project, workspace)
 }
 
 // List returns a map of all locks with their lock key as the map key.
 // The lock key can be used in GetLock() and Unlock().
 func (c *Client) List() (map[string]models.ProjectLock, error) {
 	m := make(map[string]models.ProjectLock)
-	locks, err := c.backend.List()
+	locks, err := c.database.List()
 	if err != nil {
 		return m, err
 	}
@@ -118,7 +104,7 @@ func (c *Client) List() (map[string]models.ProjectLock, error) {
 
 // UnlockByPull deletes all locks associated with that pull request.
 func (c *Client) UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error) {
-	return c.backend.UnlockByPull(repoFullName, pullNum)
+	return c.database.UnlockByPull(repoFullName, pullNum)
 }
 
 // GetLock attempts to get the lock stored at key. If successful,
@@ -131,7 +117,7 @@ func (c *Client) GetLock(key string) (*models.ProjectLock, error) {
 		return nil, err
 	}
 
-	projectLock, err := c.backend.GetLock(project, workspace)
+	projectLock, err := c.database.GetLock(project, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -140,16 +126,23 @@ func (c *Client) GetLock(key string) (*models.ProjectLock, error) {
 }
 
 func (c *Client) key(p models.Project, workspace string) string {
-	return fmt.Sprintf("%s/%s/%s", p.RepoFullName, p.Path, workspace)
+	return models.GenerateLockKey(p, workspace)
+}
+
+func IsCurrentLocking(key string) ([]string, error) {
+	matches := keyRegex.FindStringSubmatch(key)
+	if len(matches) != 5 {
+		return []string{}, errors.New("invalid key format")
+	}
+	return matches, nil
 }
 
 func (c *Client) lockKeyToProjectWorkspace(key string) (models.Project, string, error) {
-	matches := keyRegex.FindStringSubmatch(key)
-	if len(matches) != 4 {
-		return models.Project{}, "", errors.New("invalid key format")
+	matches, err := IsCurrentLocking(key)
+	if err != nil {
+		return models.Project{}, "", err
 	}
-
-	return models.Project{RepoFullName: matches[1], Path: matches[2]}, matches[3], nil
+	return models.Project{RepoFullName: matches[1], Path: matches[2], ProjectName: matches[4]}, matches[3], nil
 }
 
 type NoOpLocker struct{}
@@ -160,7 +153,7 @@ func NewNoOpLocker() *NoOpLocker {
 }
 
 // TryLock attempts to acquire a lock to a project and workspace.
-func (c *NoOpLocker) TryLock(p models.Project, workspace string, pull models.PullRequest, user models.User) (TryLockResponse, error) {
+func (c *NoOpLocker) TryLock(p models.Project, workspace string, _ models.PullRequest, _ models.User) (TryLockResponse, error) {
 	return TryLockResponse{true, models.ProjectLock{}, c.key(p, workspace)}, nil
 }
 
@@ -168,7 +161,7 @@ func (c *NoOpLocker) TryLock(p models.Project, workspace string, pull models.Pul
 // a pointer to the now deleted lock will be returned. Else, that
 // pointer will be nil. An error will only be returned if there was
 // an error deleting the lock (i.e. not if there was no lock).
-func (c *NoOpLocker) Unlock(key string) (*models.ProjectLock, error) {
+func (c *NoOpLocker) Unlock(_ string) (*models.ProjectLock, error) {
 	return &models.ProjectLock{}, nil
 }
 
@@ -180,7 +173,7 @@ func (c *NoOpLocker) List() (map[string]models.ProjectLock, error) {
 }
 
 // UnlockByPull deletes all locks associated with that pull request.
-func (c *NoOpLocker) UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error) {
+func (c *NoOpLocker) UnlockByPull(_ string, _ int) ([]models.ProjectLock, error) {
 	return []models.ProjectLock{}, nil
 }
 
@@ -188,10 +181,10 @@ func (c *NoOpLocker) UnlockByPull(repoFullName string, pullNum int) ([]models.Pr
 // a pointer to the lock will be returned. Else, the pointer will be nil.
 // An error will only be returned if there was an error getting the lock
 // (i.e. not if there was no lock).
-func (c *NoOpLocker) GetLock(key string) (*models.ProjectLock, error) {
+func (c *NoOpLocker) GetLock(_ string) (*models.ProjectLock, error) {
 	return nil, nil
 }
 
 func (c *NoOpLocker) key(p models.Project, workspace string) string {
-	return fmt.Sprintf("%s/%s/%s", p.RepoFullName, p.Path, workspace)
+	return models.GenerateLockKey(p, workspace)
 }

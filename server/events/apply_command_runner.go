@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events
 
 import (
@@ -15,14 +18,14 @@ func NewApplyCommandRunner(
 	commitStatusUpdater CommitStatusUpdater,
 	prjCommandBuilder ProjectApplyCommandBuilder,
 	prjCmdRunner ProjectApplyCommandRunner,
+	cancellationTracker CancellationTracker,
 	autoMerger *AutoMerger,
 	pullUpdater *PullUpdater,
 	dbUpdater *DBUpdater,
-	db *db.BoltDB,
+	database db.Database,
 	parallelPoolSize int,
 	SilenceNoProjects bool,
 	silenceVCSStatusNoProjects bool,
-	VCSStatusName string,
 	pullReqStatusFetcher vcs.PullReqStatusFetcher,
 ) *ApplyCommandRunner {
 	return &ApplyCommandRunner{
@@ -32,26 +35,27 @@ func NewApplyCommandRunner(
 		commitStatusUpdater:        commitStatusUpdater,
 		prjCmdBuilder:              prjCommandBuilder,
 		prjCmdRunner:               prjCmdRunner,
+		cancellationTracker:        cancellationTracker,
 		autoMerger:                 autoMerger,
 		pullUpdater:                pullUpdater,
 		dbUpdater:                  dbUpdater,
-		DB:                         db,
+		Database:                   database,
 		parallelPoolSize:           parallelPoolSize,
 		SilenceNoProjects:          SilenceNoProjects,
 		silenceVCSStatusNoProjects: silenceVCSStatusNoProjects,
-		VCSStatusName:              VCSStatusName,
 		pullReqStatusFetcher:       pullReqStatusFetcher,
 	}
 }
 
 type ApplyCommandRunner struct {
 	DisableApplyAll      bool
-	DB                   *db.BoltDB
+	Database             db.Database
 	locker               locking.ApplyLockChecker
 	vcsClient            vcs.Client
 	commitStatusUpdater  CommitStatusUpdater
 	prjCmdBuilder        ProjectApplyCommandBuilder
 	prjCmdRunner         ProjectApplyCommandRunner
+	cancellationTracker  CancellationTracker
 	autoMerger           *AutoMerger
 	pullUpdater          *PullUpdater
 	dbUpdater            *DBUpdater
@@ -62,8 +66,8 @@ type ApplyCommandRunner struct {
 	SilenceNoProjects bool
 	// SilenceVCSStatusNoPlans is whether any plan should set commit status if no projects
 	// are found
-	VCSStatusName              string
 	silenceVCSStatusNoProjects bool
+	SilencePRComments          []string
 }
 
 func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
@@ -72,7 +76,7 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	pull := ctx.Pull
 
 	locked, err := a.IsLocked()
-	// CheckApplyLock falls back to DisableApply flag if fetching the lock
+	// CheckApplyLock falls back to AllowedCommand flag if fetching the lock
 	// raises an error
 	// We will log failure as warning
 	if err != nil {
@@ -81,7 +85,7 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	if locked {
 		ctx.Log.Info("ignoring apply command since apply disabled globally")
-		if err := a.vcsClient.CreateComment(baseRepo, pull.Num, applyDisabledComment, command.Apply.String()); err != nil {
+		if err := a.vcsClient.CreateComment(ctx.Log, baseRepo, pull.Num, applyDisabledComment, command.Apply.String()); err != nil {
 			ctx.Log.Err("unable to comment on pull request: %s", err)
 		}
 
@@ -90,15 +94,11 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	if a.DisableApplyAll && !cmd.IsForSpecificProject() {
 		ctx.Log.Info("ignoring apply command without flags since apply all is disabled")
-		if err := a.vcsClient.CreateComment(baseRepo, pull.Num, applyAllDisabledComment, command.Apply.String()); err != nil {
+		if err := a.vcsClient.CreateComment(ctx.Log, baseRepo, pull.Num, applyAllDisabledComment, command.Apply.String()); err != nil {
 			ctx.Log.Err("unable to comment on pull request: %s", err)
 		}
 
 		return
-	}
-
-	if err = a.commitStatusUpdater.UpdateCombined(baseRepo, pull, models.PendingCommitStatus, cmd.CommandName()); err != nil {
-		ctx.Log.Warn("unable to update commit status: %s", err)
 	}
 
 	// Get the mergeable status before we set any build statuses of our own.
@@ -106,7 +106,7 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	// required the Atlantis status checks to pass, then we've now changed
 	// the mergeability status of the pull request.
 	// This sets the approved, mergeable, and sqlocked status in the context.
-	ctx.PullRequestStatus, err = a.pullReqStatusFetcher.FetchPullStatus(baseRepo, pull, a.VCSStatusName)
+	ctx.PullRequestStatus, err = a.pullReqStatusFetcher.FetchPullStatus(ctx.Log, pull)
 	if err != nil {
 		// On error we continue the request with mergeable assumed false.
 		// We want to continue because not all apply's will need this status,
@@ -117,9 +117,8 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	var projectCmds []command.ProjectContext
 	projectCmds, err = a.prjCmdBuilder.BuildApplyCommands(ctx, cmd)
-
 	if err != nil {
-		if statusErr := a.commitStatusUpdater.UpdateCombined(ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, cmd.CommandName()); statusErr != nil {
+		if statusErr := a.commitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.FailedCommitStatus, cmd.CommandName()); statusErr != nil {
 			ctx.Log.Warn("unable to update commit status: %s", statusErr)
 		}
 		a.pullUpdater.updatePull(ctx, cmd, command.Result{Error: err})
@@ -128,27 +127,41 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 
 	// If there are no projects to apply, don't respond to the PR and ignore
 	if len(projectCmds) == 0 && a.SilenceNoProjects {
-		ctx.Log.Info("determined there was no project to run apply in.")
+		ctx.Log.Info("determined there was no project to run plan in")
 		if !a.silenceVCSStatusNoProjects {
-			// If there were no projects modified, we set successful commit statuses
-			// with 0/0 projects applied successfully because some users require
-			// the Atlantis status to be passing for all pull requests.
-			ctx.Log.Debug("setting VCS status to success with no projects found")
-			if err := a.commitStatusUpdater.UpdateCombinedCount(baseRepo, pull, models.SuccessCommitStatus, command.Apply, 0, 0); err != nil {
-				ctx.Log.Warn("unable to update commit status: %s", err)
+			if cmd.IsForSpecificProject() {
+				// With a specific apply, just reset the status so it's not stuck in pending state
+				pullStatus, err := a.Database.GetPullStatus(pull)
+				if err != nil {
+					ctx.Log.Warn("unable to fetch pull status: %s", err)
+					return
+				}
+				if pullStatus == nil {
+					// default to 0/0
+					ctx.Log.Debug("setting VCS status to 0/0 success as no previous state was found")
+					if err := a.commitStatusUpdater.UpdateCombinedCount(ctx.Log, baseRepo, pull, models.SuccessCommitStatus, command.Apply, 0, 0); err != nil {
+						ctx.Log.Warn("unable to update commit status: %s", err)
+					}
+					return
+				}
+				ctx.Log.Debug("resetting VCS status")
+				a.updateCommitStatus(ctx, *pullStatus)
+			} else {
+				// With a generic apply, we set successful commit statuses
+				// with 0/0 projects planned successfully because some users require
+				// the Atlantis status to be passing for all pull requests.
+				// Does not apply to skipped runs for specific projects
+				ctx.Log.Debug("setting VCS status to success with no projects found")
+				if err := a.commitStatusUpdater.UpdateCombinedCount(ctx.Log, baseRepo, pull, models.SuccessCommitStatus, command.Apply, 0, 0); err != nil {
+					ctx.Log.Warn("unable to update commit status: %s", err)
+				}
 			}
 		}
 		return
 	}
 
-	// Only run commands in parallel if enabled
-	var result command.Result
-	if a.isParallelEnabled(projectCmds) {
-		ctx.Log.Info("Running applies in parallel")
-		result = runProjectCmdsParallel(projectCmds, a.prjCmdRunner.Apply, a.parallelPoolSize)
-	} else {
-		result = runProjectCmds(projectCmds, a.prjCmdRunner.Apply)
-	}
+	result := runProjectCmdsWithCancellationTracker(ctx, projectCmds, a.cancellationTracker, a.parallelPoolSize, a.isParallelEnabled(projectCmds), a.prjCmdRunner.Apply)
+	ctx.CommandHasErrors = result.HasErrors()
 
 	a.pullUpdater.updatePull(
 		ctx,
@@ -164,7 +177,7 @@ func (a *ApplyCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	a.updateCommitStatus(ctx, pullStatus)
 
 	if a.autoMerger.automergeEnabled(projectCmds) && !cmd.AutoMergeDisabled {
-		a.autoMerger.automerge(ctx, pullStatus, a.autoMerger.deleteSourceBranchOnMergeEnabled(projectCmds))
+		a.autoMerger.automerge(ctx, pullStatus, a.autoMerger.deleteSourceBranchOnMergeEnabled(projectCmds), cmd.AutoMergeMethod)
 	}
 }
 
@@ -183,7 +196,7 @@ func (a *ApplyCommandRunner) updateCommitStatus(ctx *command.Context, pullStatus
 	var numErrored int
 	status := models.SuccessCommitStatus
 
-	numSuccess = pullStatus.StatusCount(models.AppliedPlanStatus)
+	numSuccess = pullStatus.StatusCount(models.AppliedPlanStatus) + pullStatus.StatusCount(models.PlannedNoChangesPlanStatus)
 	numErrored = pullStatus.StatusCount(models.ErroredApplyStatus)
 
 	if numErrored > 0 {
@@ -195,6 +208,7 @@ func (a *ApplyCommandRunner) updateCommitStatus(ctx *command.Context, pullStatus
 	}
 
 	if err := a.commitStatusUpdater.UpdateCombinedCount(
+		ctx.Log,
 		ctx.Pull.BaseRepo,
 		ctx.Pull,
 		status,

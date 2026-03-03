@@ -4,12 +4,11 @@
 package mocks
 
 import (
+	pegomock "github.com/petergtz/pegomock/v4"
+	command "github.com/runatlantis/atlantis/server/events/command"
+	models "github.com/runatlantis/atlantis/server/events/models"
 	"reflect"
 	"time"
-
-	pegomock "github.com/petergtz/pegomock"
-	"github.com/runatlantis/atlantis/server/events/command"
-	models "github.com/runatlantis/atlantis/server/events/models"
 )
 
 type MockProjectStatusUpdater struct {
@@ -27,19 +26,19 @@ func NewMockProjectStatusUpdater(options ...pegomock.Option) *MockProjectStatusU
 func (mock *MockProjectStatusUpdater) SetFailHandler(fh pegomock.FailHandler) { mock.fail = fh }
 func (mock *MockProjectStatusUpdater) FailHandler() pegomock.FailHandler      { return mock.fail }
 
-func (mock *MockProjectStatusUpdater) UpdateProject(_param0 command.ProjectContext, _param1 command.Name, _param2 models.CommitStatus, _param3 string) error {
+func (mock *MockProjectStatusUpdater) UpdateProject(ctx command.ProjectContext, cmdName command.Name, status models.CommitStatus, url string, res *command.ProjectCommandOutput) error {
 	if mock == nil {
 		panic("mock must not be nil. Use myMock := NewMockProjectStatusUpdater().")
 	}
-	params := []pegomock.Param{_param0, _param1, _param2, _param3}
-	result := pegomock.GetGenericMockFrom(mock).Invoke("UpdateProject", params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
-	var ret0 error
-	if len(result) != 0 {
-		if result[0] != nil {
-			ret0 = result[0].(error)
+	_params := []pegomock.Param{ctx, cmdName, status, url, res}
+	_result := pegomock.GetGenericMockFrom(mock).Invoke("UpdateProject", _params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
+	var _ret0 error
+	if len(_result) != 0 {
+		if _result[0] != nil {
+			_ret0 = _result[0].(error)
 		}
 	}
-	return ret0
+	return _ret0
 }
 
 func (mock *MockProjectStatusUpdater) VerifyWasCalledOnce() *VerifierMockProjectStatusUpdater {
@@ -79,9 +78,9 @@ type VerifierMockProjectStatusUpdater struct {
 	timeout                time.Duration
 }
 
-func (verifier *VerifierMockProjectStatusUpdater) UpdateProject(_param0 command.ProjectContext, _param1 command.Name, _param2 models.CommitStatus, _param3 string) *MockProjectStatusUpdater_UpdateProject_OngoingVerification {
-	params := []pegomock.Param{_param0, _param1, _param2, _param3}
-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "UpdateProject", params, verifier.timeout)
+func (verifier *VerifierMockProjectStatusUpdater) UpdateProject(ctx command.ProjectContext, cmdName command.Name, status models.CommitStatus, url string, res *command.ProjectCommandOutput) *MockProjectStatusUpdater_UpdateProject_OngoingVerification {
+	_params := []pegomock.Param{ctx, cmdName, status, url, res}
+	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "UpdateProject", _params, verifier.timeout)
 	return &MockProjectStatusUpdater_UpdateProject_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
 }
 
@@ -90,29 +89,43 @@ type MockProjectStatusUpdater_UpdateProject_OngoingVerification struct {
 	methodInvocations []pegomock.MethodInvocation
 }
 
-func (c *MockProjectStatusUpdater_UpdateProject_OngoingVerification) GetCapturedArguments() (command.ProjectContext, command.Name, models.CommitStatus, string) {
-	_param0, _param1, _param2, _param3 := c.GetAllCapturedArguments()
-	return _param0[len(_param0)-1], _param1[len(_param1)-1], _param2[len(_param2)-1], _param3[len(_param3)-1]
+func (c *MockProjectStatusUpdater_UpdateProject_OngoingVerification) GetCapturedArguments() (command.ProjectContext, command.Name, models.CommitStatus, string, *command.ProjectCommandOutput) {
+	ctx, cmdName, status, url, res := c.GetAllCapturedArguments()
+	return ctx[len(ctx)-1], cmdName[len(cmdName)-1], status[len(status)-1], url[len(url)-1], res[len(res)-1]
 }
 
-func (c *MockProjectStatusUpdater_UpdateProject_OngoingVerification) GetAllCapturedArguments() (_param0 []command.ProjectContext, _param1 []command.Name, _param2 []models.CommitStatus, _param3 []string) {
-	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
-	if len(params) > 0 {
-		_param0 = make([]command.ProjectContext, len(c.methodInvocations))
-		for u, param := range params[0] {
-			_param0[u] = param.(command.ProjectContext)
+func (c *MockProjectStatusUpdater_UpdateProject_OngoingVerification) GetAllCapturedArguments() (_param0 []command.ProjectContext, _param1 []command.Name, _param2 []models.CommitStatus, _param3 []string, _param4 []*command.ProjectCommandOutput) {
+	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+	if len(_params) > 0 {
+		if len(_params) > 0 {
+			_param0 = make([]command.ProjectContext, len(c.methodInvocations))
+			for u, param := range _params[0] {
+				_param0[u] = param.(command.ProjectContext)
+			}
 		}
-		_param1 = make([]command.Name, len(c.methodInvocations))
-		for u, param := range params[1] {
-			_param1[u] = param.(command.Name)
+		if len(_params) > 1 {
+			_param1 = make([]command.Name, len(c.methodInvocations))
+			for u, param := range _params[1] {
+				_param1[u] = param.(command.Name)
+			}
 		}
-		_param2 = make([]models.CommitStatus, len(c.methodInvocations))
-		for u, param := range params[2] {
-			_param2[u] = param.(models.CommitStatus)
+		if len(_params) > 2 {
+			_param2 = make([]models.CommitStatus, len(c.methodInvocations))
+			for u, param := range _params[2] {
+				_param2[u] = param.(models.CommitStatus)
+			}
 		}
-		_param3 = make([]string, len(c.methodInvocations))
-		for u, param := range params[3] {
-			_param3[u] = param.(string)
+		if len(_params) > 3 {
+			_param3 = make([]string, len(c.methodInvocations))
+			for u, param := range _params[3] {
+				_param3[u] = param.(string)
+			}
+		}
+		if len(_params) > 4 {
+			_param4 = make([]*command.ProjectCommandOutput, len(c.methodInvocations))
+			for u, param := range _params[4] {
+				_param4[u] = param.(*command.ProjectCommandOutput)
+			}
 		}
 	}
 	return

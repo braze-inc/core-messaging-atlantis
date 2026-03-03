@@ -4,11 +4,11 @@
 package mocks
 
 import (
+	pegomock "github.com/petergtz/pegomock/v4"
+	events "github.com/runatlantis/atlantis/server/events"
+	command "github.com/runatlantis/atlantis/server/events/command"
 	"reflect"
 	"time"
-
-	pegomock "github.com/petergtz/pegomock"
-	"github.com/runatlantis/atlantis/server/events/command"
 )
 
 type MockPostWorkflowHooksCommandRunner struct {
@@ -28,19 +28,19 @@ func (mock *MockPostWorkflowHooksCommandRunner) SetFailHandler(fh pegomock.FailH
 }
 func (mock *MockPostWorkflowHooksCommandRunner) FailHandler() pegomock.FailHandler { return mock.fail }
 
-func (mock *MockPostWorkflowHooksCommandRunner) RunPostHooks(ctx *command.Context) error {
+func (mock *MockPostWorkflowHooksCommandRunner) RunPostHooks(ctx *command.Context, cmd *events.CommentCommand) error {
 	if mock == nil {
 		panic("mock must not be nil. Use myMock := NewMockPostWorkflowHooksCommandRunner().")
 	}
-	params := []pegomock.Param{ctx}
-	result := pegomock.GetGenericMockFrom(mock).Invoke("RunPostHooks", params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
-	var ret0 error
-	if len(result) != 0 {
-		if result[0] != nil {
-			ret0 = result[0].(error)
+	_params := []pegomock.Param{ctx, cmd}
+	_result := pegomock.GetGenericMockFrom(mock).Invoke("RunPostHooks", _params, []reflect.Type{reflect.TypeOf((*error)(nil)).Elem()})
+	var _ret0 error
+	if len(_result) != 0 {
+		if _result[0] != nil {
+			_ret0 = _result[0].(error)
 		}
 	}
-	return ret0
+	return _ret0
 }
 
 func (mock *MockPostWorkflowHooksCommandRunner) VerifyWasCalledOnce() *VerifierMockPostWorkflowHooksCommandRunner {
@@ -80,9 +80,9 @@ type VerifierMockPostWorkflowHooksCommandRunner struct {
 	timeout                time.Duration
 }
 
-func (verifier *VerifierMockPostWorkflowHooksCommandRunner) RunPostHooks(ctx *command.Context) *MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification {
-	params := []pegomock.Param{ctx}
-	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "RunPostHooks", params, verifier.timeout)
+func (verifier *VerifierMockPostWorkflowHooksCommandRunner) RunPostHooks(ctx *command.Context, cmd *events.CommentCommand) *MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification {
+	_params := []pegomock.Param{ctx, cmd}
+	methodInvocations := pegomock.GetGenericMockFrom(verifier.mock).Verify(verifier.inOrderContext, verifier.invocationCountMatcher, "RunPostHooks", _params, verifier.timeout)
 	return &MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification{mock: verifier.mock, methodInvocations: methodInvocations}
 }
 
@@ -91,17 +91,25 @@ type MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification struct 
 	methodInvocations []pegomock.MethodInvocation
 }
 
-func (c *MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification) GetCapturedArguments() *command.Context {
-	ctx := c.GetAllCapturedArguments()
-	return ctx[len(ctx)-1]
+func (c *MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification) GetCapturedArguments() (*command.Context, *events.CommentCommand) {
+	ctx, cmd := c.GetAllCapturedArguments()
+	return ctx[len(ctx)-1], cmd[len(cmd)-1]
 }
 
-func (c *MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification) GetAllCapturedArguments() (_param0 []*command.Context) {
-	params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
-	if len(params) > 0 {
-		_param0 = make([]*command.Context, len(c.methodInvocations))
-		for u, param := range params[0] {
-			_param0[u] = param.(*command.Context)
+func (c *MockPostWorkflowHooksCommandRunner_RunPostHooks_OngoingVerification) GetAllCapturedArguments() (_param0 []*command.Context, _param1 []*events.CommentCommand) {
+	_params := pegomock.GetGenericMockFrom(c.mock).GetInvocationParams(c.methodInvocations)
+	if len(_params) > 0 {
+		if len(_params) > 0 {
+			_param0 = make([]*command.Context, len(c.methodInvocations))
+			for u, param := range _params[0] {
+				_param0[u] = param.(*command.Context)
+			}
+		}
+		if len(_params) > 1 {
+			_param1 = make([]*events.CommentCommand, len(c.methodInvocations))
+			for u, param := range _params[1] {
+				_param1[u] = param.(*events.CommentCommand)
+			}
 		}
 	}
 	return

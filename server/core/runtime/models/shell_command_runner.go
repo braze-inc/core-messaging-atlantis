@@ -1,15 +1,20 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package models
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/pkg/errors"
+	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/terraform/ansi"
 	"github.com/runatlantis/atlantis/server/events/command"
-	"github.com/runatlantis/atlantis/server/events/terraform/ansi"
 	"github.com/runatlantis/atlantis/server/jobs"
 )
 
@@ -32,10 +37,27 @@ type ShellCommandRunner struct {
 	outputHandler jobs.ProjectCommandOutputHandler
 	streamOutput  bool
 	cmd           *exec.Cmd
+	shell         *valid.CommandShell
 }
 
-func NewShellCommandRunner(command string, environ []string, workingDir string, streamOutput bool, outputHandler jobs.ProjectCommandOutputHandler) *ShellCommandRunner {
-	cmd := exec.Command("sh", "-c", command) // #nosec
+func NewShellCommandRunner(
+	shell *valid.CommandShell,
+	command string,
+	environ []string,
+	workingDir string,
+	streamOutput bool,
+	outputHandler jobs.ProjectCommandOutputHandler,
+) *ShellCommandRunner {
+	if shell == nil {
+		shell = &valid.CommandShell{
+			Shell:     "sh",
+			ShellArgs: []string{"-c"},
+		}
+	}
+	var args []string
+	args = append(args, shell.ShellArgs...)
+	args = append(args, command)
+	cmd := exec.Command(shell.Shell, args...) // #nosec
 	cmd.Env = environ
 	cmd.Dir = workingDir
 
@@ -45,6 +67,7 @@ func NewShellCommandRunner(command string, environ []string, workingDir string, 
 		outputHandler: outputHandler,
 		streamOutput:  streamOutput,
 		cmd:           cmd,
+		shell:         shell,
 	}
 }
 
@@ -76,6 +99,7 @@ func (s *ShellCommandRunner) Run(ctx command.ProjectContext) (string, error) {
 func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<- string, <-chan Line) {
 	outCh := make(chan Line)
 	inCh := make(chan string)
+	start := time.Now()
 
 	// We start a goroutine to do our work asynchronously and then immediately
 	// return our channels.
@@ -90,10 +114,10 @@ func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<-
 		stderr, _ := s.cmd.StderrPipe()
 		stdin, _ := s.cmd.StdinPipe()
 
-		ctx.Log.Debug("starting %q in %q", s.command, s.workingDir)
+		ctx.Log.Debug("starting '%s %q' in '%s'", s.shell.String(), s.command, s.workingDir)
 		err := s.cmd.Start()
 		if err != nil {
-			err = errors.Wrapf(err, "running %q in %q", s.command, s.workingDir)
+			err = fmt.Errorf("running '%s %q' in '%s': %w", s.shell.String(), s.command, s.workingDir, err)
 			ctx.Log.Err(err.Error())
 			outCh <- Line{Err: err}
 			return
@@ -106,7 +130,8 @@ func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<-
 				ctx.Log.Debug("writing %q to remote command's stdin", line)
 				_, err := io.WriteString(stdin, line)
 				if err != nil {
-					ctx.Log.Err(errors.Wrapf(err, "writing %q to process", line).Error())
+					err = fmt.Errorf("writing %q to process: %w", line, err)
+					ctx.Log.Err(err.Error())
 				}
 			}
 		}()
@@ -147,13 +172,17 @@ func (s *ShellCommandRunner) RunCommandAsync(ctx command.ProjectContext) (chan<-
 		// Wait for the command to complete.
 		err = s.cmd.Wait()
 
+		dur := time.Since(start)
+		log := ctx.Log.With("duration", dur)
+
 		// We're done now. Send an error if there was one.
 		if err != nil {
-			err = errors.Wrapf(err, "running %q in %q", s.command, s.workingDir)
-			ctx.Log.Err(err.Error())
+			err = fmt.Errorf("running '%s' '%s' in '%s': %w", s.shell.String(), s.command, s.workingDir, err)
+			log.Err(err.Error())
 			outCh <- Line{Err: err}
 		} else {
-			ctx.Log.Info("successfully ran %q in %q", s.command, s.workingDir)
+			log.Info("successfully ran '%s' '%s' in '%s'",
+				s.shell.String(), s.command, s.workingDir)
 		}
 	}()
 

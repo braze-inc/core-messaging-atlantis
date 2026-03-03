@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package runtime
 
 import (
@@ -5,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/go-version"
-	. "github.com/petergtz/pegomock"
+	. "github.com/petergtz/pegomock/v4"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime/mocks"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -43,7 +46,7 @@ func TestRun(t *testing.T) {
 	}
 
 	executorWorkflow := mocks.NewMockVersionedExecutorWorkflow()
-	s := &PolicyCheckStepRunner{
+	s := &policyCheckStepRunner{
 		versionEnsurer: executorWorkflow,
 		executor:       executorWorkflow,
 	}

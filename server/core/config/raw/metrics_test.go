@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw_test
 
 import (
@@ -6,7 +9,6 @@ import (
 
 	"github.com/runatlantis/atlantis/server/core/config/raw"
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
 )
 
 func TestMetrics_Unmarshal(t *testing.T) {
@@ -22,7 +24,7 @@ prometheus:
 
 		var result raw.Metrics
 
-		err := yaml.UnmarshalStrict([]byte(rawYaml), &result)
+		err := unmarshalString(rawYaml, &result)
 		assert.NoError(t, err)
 	})
 
@@ -36,7 +38,7 @@ prometheus:
 	"prometheus": {
 		"endpoint": "/metrics"
 	}
-}		
+}
 `
 
 		var result raw.Metrics
@@ -56,6 +58,15 @@ func TestMetrics_Validate_Success(t *testing.T) {
 			subject: raw.Metrics{
 				Statsd: &raw.Statsd{
 					Host: "127.0.0.1",
+					Port: "8125",
+				},
+			},
+		},
+		{
+			description: "success with stats config using hostname",
+			subject: raw.Metrics{
+				Statsd: &raw.Statsd{
+					Host: "localhost",
 					Port: "8125",
 				},
 			},
@@ -119,15 +130,6 @@ func TestMetrics_Validate_Error(t *testing.T) {
 				Statsd: &raw.Statsd{
 					Host: "127.0.0.1",
 					Port: "string",
-				},
-			},
-		},
-		{
-			description: "invalid host",
-			subject: raw.Metrics{
-				Statsd: &raw.Statsd{
-					Host: "127.0.1",
-					Port: "8125",
 				},
 			},
 		},

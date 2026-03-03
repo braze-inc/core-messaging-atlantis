@@ -1,4 +1,16 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw_test
+
+import (
+	"io"
+	"strings"
+
+	"errors"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Bool is a helper routine that allocates a new bool value
 // to store v and returns a pointer to it.
@@ -11,3 +23,15 @@ func Int(v int) *int { return &v }
 // String is a helper routine that allocates a new string value
 // to store v and returns a pointer to it.
 func String(v string) *string { return &v }
+
+// Helper function to unmarshal from strings
+func unmarshalString(in string, out any) error {
+	decoder := yaml.NewDecoder(strings.NewReader(in))
+	decoder.KnownFields(true)
+
+	err := decoder.Decode(out)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
+}

@@ -14,91 +14,105 @@
 package events_test
 
 import (
-	"io/ioutil"
+	"errors"
+	"fmt"
+	"os"
 	"testing"
 
-	"github.com/pkg/errors"
-	"github.com/runatlantis/atlantis/server/core/db"
+	"github.com/runatlantis/atlantis/server/core/boltdb"
 	"github.com/runatlantis/atlantis/server/jobs"
+	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/stretchr/testify/assert"
 	bolt "go.etcd.io/bbolt"
 
-	. "github.com/petergtz/pegomock"
+	. "github.com/petergtz/pegomock/v4"
 	lockmocks "github.com/runatlantis/atlantis/server/core/locking/mocks"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/mocks"
-	"github.com/runatlantis/atlantis/server/events/mocks/matchers"
 	"github.com/runatlantis/atlantis/server/events/models"
-	"github.com/runatlantis/atlantis/server/events/models/fixtures"
+	"github.com/runatlantis/atlantis/server/events/models/testdata"
 	vcsmocks "github.com/runatlantis/atlantis/server/events/vcs/mocks"
 	loggermocks "github.com/runatlantis/atlantis/server/logging/mocks"
 	. "github.com/runatlantis/atlantis/testing"
+	"go.uber.org/mock/gomock"
 )
 
 func TestCleanUpPullWorkspaceErr(t *testing.T) {
 	t.Log("when workspace.Delete returns an error, we return it")
 	RegisterMockTestingT(t)
+	logger := logging.NewNoopLogger(t)
 	w := mocks.NewMockWorkingDir()
-	tmp, cleanup := TempDir(t)
-	defer cleanup()
-	db, err := db.New(tmp)
+	tmp := t.TempDir()
+	db, err := boltdb.New(tmp)
+	t.Cleanup(func() {
+		db.Close()
+	})
 	Ok(t, err)
 	pce := events.PullClosedExecutor{
 		WorkingDir:         w,
 		PullClosedTemplate: &events.PullClosedEventTemplate{},
-		DB:                 db,
+		Database:           db,
 	}
 	err = errors.New("err")
-	When(w.Delete(fixtures.GithubRepo, fixtures.Pull)).ThenReturn(err)
-	actualErr := pce.CleanUpPull(fixtures.GithubRepo, fixtures.Pull)
+	When(w.Delete(logger, testdata.GithubRepo, testdata.Pull)).ThenReturn(err)
+	actualErr := pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 	Equals(t, "cleaning workspace: err", actualErr.Error())
 }
 
 func TestCleanUpPullUnlockErr(t *testing.T) {
 	t.Log("when locker.UnlockByPull returns an error, we return it")
 	RegisterMockTestingT(t)
+	logger := logging.NewNoopLogger(t)
 	w := mocks.NewMockWorkingDir()
-	l := lockmocks.NewMockLocker()
-	tmp, cleanup := TempDir(t)
-	defer cleanup()
-	db, err := db.New(tmp)
+	ctrl := gomock.NewController(t)
+	l := lockmocks.NewMockLocker(ctrl)
+	tmp := t.TempDir()
+	db, err := boltdb.New(tmp)
+	t.Cleanup(func() {
+		db.Close()
+	})
 	Ok(t, err)
 	pce := events.PullClosedExecutor{
 		Locker:             l,
 		WorkingDir:         w,
-		DB:                 db,
+		Database:           db,
 		PullClosedTemplate: &events.PullClosedEventTemplate{},
 	}
 	err = errors.New("err")
-	When(l.UnlockByPull(fixtures.GithubRepo.FullName, fixtures.Pull.Num)).ThenReturn(nil, err)
-	actualErr := pce.CleanUpPull(fixtures.GithubRepo, fixtures.Pull)
+	l.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(nil, err)
+	actualErr := pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 	Equals(t, "cleaning up locks: err", actualErr.Error())
 }
 
 func TestCleanUpPullNoLocks(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
 	t.Log("when there are no locks to clean up, we don't comment")
 	RegisterMockTestingT(t)
 	w := mocks.NewMockWorkingDir()
-	l := lockmocks.NewMockLocker()
+	ctrl := gomock.NewController(t)
+	l := lockmocks.NewMockLocker(ctrl)
 	cp := vcsmocks.NewMockClient()
-	tmp, cleanup := TempDir(t)
-	defer cleanup()
-	db, err := db.New(tmp)
+	tmp := t.TempDir()
+	db, err := boltdb.New(tmp)
+	t.Cleanup(func() {
+		db.Close()
+	})
 	Ok(t, err)
 	pce := events.PullClosedExecutor{
 		Locker:     l,
 		VCSClient:  cp,
 		WorkingDir: w,
-		DB:         db,
+		Database:   db,
 	}
-	When(l.UnlockByPull(fixtures.GithubRepo.FullName, fixtures.Pull.Num)).ThenReturn(nil, nil)
-	err = pce.CleanUpPull(fixtures.GithubRepo, fixtures.Pull)
+	l.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(nil, nil)
+	err = pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 	Ok(t, err)
-	cp.VerifyWasCalled(Never()).CreateComment(matchers.AnyModelsRepo(), AnyInt(), AnyString(), AnyString())
+	cp.VerifyWasCalled(Never()).CreateComment(Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]())
 }
 
 func TestCleanUpPullComments(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
 	t.Log("should comment correctly")
 	RegisterMockTestingT(t)
 	cases := []struct {
@@ -110,17 +124,28 @@ func TestCleanUpPullComments(t *testing.T) {
 			"single lock, empty path",
 			[]models.ProjectLock{
 				{
-					Project:   models.NewProject("owner/repo", ""),
+					Project:   models.NewProject("owner/repo", "", ""),
 					Workspace: "default",
 				},
 			},
 			"- dir: `.` workspace: `default`",
 		},
 		{
+			"single lock, named project",
+			[]models.ProjectLock{
+				{
+					Project:   models.NewProject("owner/repo", "", "projectname"),
+					Workspace: "default",
+				},
+			},
+			// TODO: Should project name be included in output?
+			"- dir: `.` workspace: `default`",
+		},
+		{
 			"single lock, non-empty path",
 			[]models.ProjectLock{
 				{
-					Project:   models.NewProject("owner/repo", "path"),
+					Project:   models.NewProject("owner/repo", "path", ""),
 					Workspace: "default",
 				},
 			},
@@ -130,11 +155,11 @@ func TestCleanUpPullComments(t *testing.T) {
 			"single path, multiple workspaces",
 			[]models.ProjectLock{
 				{
-					Project:   models.NewProject("owner/repo", "path"),
+					Project:   models.NewProject("owner/repo", "path", ""),
 					Workspace: "workspace1",
 				},
 				{
-					Project:   models.NewProject("owner/repo", "path"),
+					Project:   models.NewProject("owner/repo", "path", ""),
 					Workspace: "workspace2",
 				},
 			},
@@ -144,19 +169,19 @@ func TestCleanUpPullComments(t *testing.T) {
 			"multiple paths, multiple workspaces",
 			[]models.ProjectLock{
 				{
-					Project:   models.NewProject("owner/repo", "path"),
+					Project:   models.NewProject("owner/repo", "path", ""),
 					Workspace: "workspace1",
 				},
 				{
-					Project:   models.NewProject("owner/repo", "path"),
+					Project:   models.NewProject("owner/repo", "path", ""),
 					Workspace: "workspace2",
 				},
 				{
-					Project:   models.NewProject("owner/repo", "path2"),
+					Project:   models.NewProject("owner/repo", "path2", ""),
 					Workspace: "workspace1",
 				},
 				{
-					Project:   models.NewProject("owner/repo", "path2"),
+					Project:   models.NewProject("owner/repo", "path2", ""),
 					Workspace: "workspace2",
 				},
 			},
@@ -167,22 +192,26 @@ func TestCleanUpPullComments(t *testing.T) {
 		func() {
 			w := mocks.NewMockWorkingDir()
 			cp := vcsmocks.NewMockClient()
-			l := lockmocks.NewMockLocker()
-			tmp, cleanup := TempDir(t)
-			defer cleanup()
-			db, err := db.New(tmp)
+			ctrl := gomock.NewController(t)
+			l := lockmocks.NewMockLocker(ctrl)
+			tmp := t.TempDir()
+			db, err := boltdb.New(tmp)
+			t.Cleanup(func() {
+				db.Close()
+			})
 			Ok(t, err)
 			pce := events.PullClosedExecutor{
 				Locker:     l,
 				VCSClient:  cp,
 				WorkingDir: w,
-				DB:         db,
+				Database:   db,
 			}
 			t.Log("testing: " + c.Description)
-			When(l.UnlockByPull(fixtures.GithubRepo.FullName, fixtures.Pull.Num)).ThenReturn(c.Locks, nil)
-			err = pce.CleanUpPull(fixtures.GithubRepo, fixtures.Pull)
+			l.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(c.Locks, nil)
+			err = pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 			Ok(t, err)
-			_, _, comment, _ := cp.VerifyWasCalledOnce().CreateComment(matchers.AnyModelsRepo(), AnyInt(), AnyString(), AnyString()).GetCapturedArguments()
+			_, _, _, comment, _ := cp.VerifyWasCalledOnce().CreateComment(
+				Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]()).GetCapturedArguments()
 
 			expected := "Locks and plans deleted for the projects and workspaces modified in this pull request:\n\n" + c.Exp
 			Equals(t, expected, comment)
@@ -191,6 +220,7 @@ func TestCleanUpPullComments(t *testing.T) {
 }
 
 func TestCleanUpLogStreaming(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
 	RegisterMockTestingT(t)
 
 	t.Run("Should Clean Up Log Streaming Resources When PR is closed", func(t *testing.T) {
@@ -199,9 +229,9 @@ func TestCleanUpLogStreaming(t *testing.T) {
 		prjCmdOutput := make(chan *jobs.ProjectCmdOutputLine)
 		prjCmdOutHandler := jobs.NewAsyncProjectCommandOutputHandler(prjCmdOutput, logger)
 		ctx := command.ProjectContext{
-			BaseRepo:    fixtures.GithubRepo,
-			Pull:        fixtures.Pull,
-			ProjectName: *fixtures.Project.Name,
+			BaseRepo:    testdata.GithubRepo,
+			Pull:        testdata.Pull,
+			ProjectName: *testdata.Project.Name,
 			Workspace:   "default",
 		}
 
@@ -213,9 +243,9 @@ func TestCleanUpLogStreaming(t *testing.T) {
 		var configBucket = "configBucket"
 		var pullsBucketName = "pulls"
 
-		f, err := ioutil.TempFile("", "")
+		f, err := os.CreateTemp("", "")
 		if err != nil {
-			panic(errors.Wrap(err, "failed to create temp file"))
+			panic(fmt.Errorf("failed to create temp file: %w", err))
 		}
 		path := f.Name()
 		f.Close() // nolint: errcheck
@@ -223,58 +253,59 @@ func TestCleanUpLogStreaming(t *testing.T) {
 		// Open the database.
 		boltDB, err := bolt.Open(path, 0600, nil)
 		if err != nil {
-			panic(errors.Wrap(err, "could not start bolt DB"))
+			panic(fmt.Errorf("could not start bolt DB: %w", err))
 		}
 		if err := boltDB.Update(func(tx *bolt.Tx) error {
 			if _, err := tx.CreateBucketIfNotExists([]byte(pullsBucketName)); err != nil {
-				return errors.Wrap(err, "failed to create bucket")
+				return fmt.Errorf("failed to create bucket: %w", err)
 			}
 			return nil
 		}); err != nil {
-			panic(errors.Wrap(err, "could not create bucket"))
+			panic(fmt.Errorf("could not create bucket: %w", err))
 		}
-		db, _ := db.NewWithDB(boltDB, lockBucket, configBucket)
+		database, _ := boltdb.NewWithDB(boltDB, lockBucket, configBucket)
 		result := []command.ProjectResult{
 			{
-				RepoRelDir:  fixtures.GithubRepo.FullName,
+				RepoRelDir:  testdata.GithubRepo.FullName,
 				Workspace:   "default",
-				ProjectName: *fixtures.Project.Name,
+				ProjectName: *testdata.Project.Name,
 			},
 		}
 
 		// Create a new record for pull
-		_, err = db.UpdatePullWithResults(fixtures.Pull, result)
+		_, err = database.UpdatePullWithResults(testdata.Pull, result)
 		Ok(t, err)
 
 		workingDir := mocks.NewMockWorkingDir()
-		locker := lockmocks.NewMockLocker()
+		gmockCtrl := gomock.NewController(t)
+		locker := lockmocks.NewMockLocker(gmockCtrl)
 		client := vcsmocks.NewMockClient()
 		logger := loggermocks.NewMockSimpleLogging()
 
 		pullClosedExecutor := events.PullClosedExecutor{
 			Locker:                   locker,
 			WorkingDir:               workingDir,
-			DB:                       db,
+			Database:                 database,
 			VCSClient:                client,
 			PullClosedTemplate:       &events.PullClosedEventTemplate{},
 			LogStreamResourceCleaner: prjCmdOutHandler,
-			Logger:                   logger,
 		}
 
 		locks := []models.ProjectLock{
 			{
-				Project:   models.NewProject(fixtures.GithubRepo.FullName, ""),
+				Project:   models.NewProject(testdata.GithubRepo.FullName, "", ""),
 				Workspace: "default",
 			},
 		}
-		When(locker.UnlockByPull(fixtures.GithubRepo.FullName, fixtures.Pull.Num)).ThenReturn(locks, nil)
+		locker.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(locks, nil)
 
 		// Clean up.
-		err = pullClosedExecutor.CleanUpPull(fixtures.GithubRepo, fixtures.Pull)
+		err = pullClosedExecutor.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 		Ok(t, err)
 
 		close(prjCmdOutput)
-		_, _, comment, _ := client.VerifyWasCalledOnce().CreateComment(matchers.AnyModelsRepo(), AnyInt(), AnyString(), AnyString()).GetCapturedArguments()
+		_, _, _, comment, _ := client.VerifyWasCalledOnce().CreateComment(
+			Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]()).GetCapturedArguments()
 		expectedComment := "Locks and plans deleted for the projects and workspaces modified in this pull request:\n\n" + "- dir: `.` workspace: `default`"
 		Equals(t, expectedComment, comment)
 
@@ -283,4 +314,88 @@ func TestCleanUpLogStreaming(t *testing.T) {
 		assert.Empty(t, dfPrjCmdOutputHandler.GetProjectOutputBuffer(ctx.PullInfo()))
 		assert.Empty(t, dfPrjCmdOutputHandler.GetReceiverBufferForPull(ctx.PullInfo()))
 	})
+}
+
+func TestCleanUpPullWithCorrectJobContext(t *testing.T) {
+	t.Log("CleanUpPull should call LogStreamResourceCleaner.CleanUp with complete PullInfo including RepoFullName and Path")
+	RegisterMockTestingT(t)
+	logger := logging.NewNoopLogger(t)
+
+	// Create mocks
+	workingDir := mocks.NewMockWorkingDir()
+	gmockCtrl := gomock.NewController(t)
+	locker := lockmocks.NewMockLocker(gmockCtrl)
+	client := vcsmocks.NewMockClient()
+	resourceCleaner := mocks.NewMockResourceCleaner()
+
+	// Create temporary database
+	tmp := t.TempDir()
+	db, err := boltdb.New(tmp)
+	t.Cleanup(func() {
+		db.Close()
+	})
+	Ok(t, err)
+
+	// Create test data with multiple projects to verify all fields are populated correctly
+	testProjects := []command.ProjectResult{
+		{
+			RepoRelDir:  "path/to/project1",
+			Workspace:   "default",
+			ProjectName: "project1",
+		},
+		{
+			RepoRelDir:  "path/to/project2",
+			Workspace:   "staging",
+			ProjectName: "project2",
+		},
+	}
+
+	// Add pull status to database
+	_, err = db.UpdatePullWithResults(testdata.Pull, testProjects)
+	Ok(t, err)
+
+	// Create executor
+	pce := events.PullClosedExecutor{
+		Locker:                   locker,
+		VCSClient:                client,
+		WorkingDir:               workingDir,
+		Database:                 db,
+		PullClosedTemplate:       &events.PullClosedEventTemplate{},
+		LogStreamResourceCleaner: resourceCleaner,
+	}
+
+	// Setup mock expectations
+	locker.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(nil, nil)
+
+	// Execute CleanUpPull
+	err = pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
+	Ok(t, err)
+
+	// Verify ResourceCleaner.CleanUp was called twice (once for each project)
+	resourceCleaner.VerifyWasCalled(Times(2)).CleanUp(Any[jobs.PullInfo]())
+
+	// Get the captured arguments to verify they contain all required fields
+	capturedArgs := resourceCleaner.VerifyWasCalled(Times(2)).CleanUp(Any[jobs.PullInfo]()).GetAllCapturedArguments()
+
+	// Verify first project's PullInfo
+	expectedPullInfo1 := jobs.PullInfo{
+		PullNum:      testdata.Pull.Num,
+		Repo:         testdata.Pull.BaseRepo.Name,
+		RepoFullName: testdata.Pull.BaseRepo.FullName,
+		ProjectName:  "project1",
+		Path:         "path/to/project1",
+		Workspace:    "default",
+	}
+	Equals(t, expectedPullInfo1, capturedArgs[0])
+
+	// Verify second project's PullInfo
+	expectedPullInfo2 := jobs.PullInfo{
+		PullNum:      testdata.Pull.Num,
+		Repo:         testdata.Pull.BaseRepo.Name,
+		RepoFullName: testdata.Pull.BaseRepo.FullName,
+		ProjectName:  "project2",
+		Path:         "path/to/project2",
+		Workspace:    "staging",
+	}
+	Equals(t, expectedPullInfo2, capturedArgs[1])
 }
