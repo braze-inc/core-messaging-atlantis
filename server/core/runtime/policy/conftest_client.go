@@ -1,19 +1,29 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package policy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
+	"encoding/json"
+	"regexp"
+
+	"github.com/hashicorp/go-getter/v2"
+
 	version "github.com/hashicorp/go-version"
-	"github.com/pkg/errors"
+
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime/cache"
 	runtime_models "github.com/runatlantis/atlantis/server/core/runtime/models"
-	"github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
@@ -21,7 +31,6 @@ const (
 	DefaultConftestVersionEnvKey = "DEFAULT_CONFTEST_VERSION"
 	conftestBinaryName           = "conftest"
 	conftestDownloadURLPrefix    = "https://github.com/open-policy-agent/conftest/releases/download/v"
-	conftestArch                 = "x86_64"
 )
 
 type Arg struct {
@@ -69,8 +78,9 @@ func (c ConftestTestCommandArgs) build() ([]string, error) {
 	return commandArgs, nil
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_conftest_client.go SourceResolver
 // SourceResolver resolves the policy set to a local fs path
+//
+//go:generate pegomock generate --package mocks -o mocks/mock_conftest_client.go SourceResolver
 type SourceResolver interface {
 	Resolve(policySet valid.PolicySet) (string, error)
 }
@@ -98,15 +108,33 @@ func (p *SourceResolverProxy) Resolve(policySet valid.PolicySet) (string, error)
 	}
 }
 
+//go:generate pegomock generate --package mocks -o mocks/mock_downloader.go Downloader
+
+type Downloader interface {
+	GetAny(dst, src string) error
+}
+
+type ConfTestGoGetterVersionDownloader struct{}
+
+func (c ConfTestGoGetterVersionDownloader) GetAny(dst, src string) error {
+	_, err := getter.GetAny(context.Background(), dst, src)
+	return err
+}
+
 type ConfTestVersionDownloader struct {
-	downloader terraform.Downloader
+	downloader Downloader
 }
 
 func (c ConfTestVersionDownloader) downloadConfTestVersion(v *version.Version, destPath string) (runtime_models.FilePath, error) {
 	versionURLPrefix := fmt.Sprintf("%s%s", conftestDownloadURLPrefix, v.Original())
 
+	conftestPlatform := getPlatform()
+	if conftestPlatform == "" {
+		return runtime_models.LocalFilePath(""), fmt.Errorf("don't know where to find conftest for %s on %s", runtime.GOOS, runtime.GOARCH)
+	}
+
 	// download binary in addition to checksum file
-	binURL := fmt.Sprintf("%s/conftest_%s_%s_%s.tar.gz", versionURLPrefix, v.Original(), strings.Title(runtime.GOOS), conftestArch)
+	binURL := fmt.Sprintf("%s/conftest_%s_%s.tar.gz", versionURLPrefix, v.Original(), conftestPlatform)
 	checksumURL := fmt.Sprintf("%s/checksums.txt", versionURLPrefix)
 
 	// underlying implementation uses go-getter so the URL is formatted as such.
@@ -115,7 +143,7 @@ func (c ConfTestVersionDownloader) downloadConfTestVersion(v *version.Version, d
 	fullSrcURL := fmt.Sprintf("%s?checksum=file:%s", binURL, checksumURL)
 
 	if err := c.downloader.GetAny(destPath, fullSrcURL); err != nil {
-		return runtime_models.LocalFilePath(""), errors.Wrapf(err, "downloading conftest version %s at %q", v.String(), fullSrcURL)
+		return runtime_models.LocalFilePath(""), fmt.Errorf("downloading conftest version %s at %q: %w", v.String(), fullSrcURL, err)
 	}
 
 	binPath := filepath.Join(destPath, "conftest")
@@ -132,7 +160,7 @@ type ConfTestExecutorWorkflow struct {
 	Exec                   runtime_models.Exec
 }
 
-func NewConfTestExecutorWorkflow(log logging.SimpleLogging, versionRootDir string, conftestDownloder terraform.Downloader) *ConfTestExecutorWorkflow {
+func NewConfTestExecutorWorkflow(log logging.SimpleLogging, versionRootDir string, conftestDownloder Downloader) *ConfTestExecutorWorkflow {
 	downloader := ConfTestVersionDownloader{
 		downloader: conftestDownloder,
 	}
@@ -140,7 +168,7 @@ func NewConfTestExecutorWorkflow(log logging.SimpleLogging, versionRootDir strin
 
 	if err != nil {
 		// conftest default versions are not essential to service startup so let's not block on it.
-		log.Warn("failed to get default conftest version. Will attempt request scoped lazy loads %s", err.Error())
+		log.Info("failed to get default conftest version. Will attempt request scoped lazy loads %s", err.Error())
 	}
 
 	versionCache := cache.NewExecutionVersionLayeredLoadingCache(
@@ -160,57 +188,90 @@ func NewConfTestExecutorWorkflow(log logging.SimpleLogging, versionRootDir strin
 }
 
 func (c *ConfTestExecutorWorkflow) Run(ctx command.ProjectContext, executablePath string, envs map[string]string, workdir string, extraArgs []string) (string, error) {
-	policyArgs := []Arg{}
-	policySetNames := []string{}
 	ctx.Log.Debug("policy sets, %s ", ctx.PolicySets)
+
+	inputFile := filepath.Join(workdir, ctx.GetShowResultFileName())
+	var policySetResults []models.PolicySetResult
+	var combinedErr error
+
 	for _, policySet := range ctx.PolicySets.PolicySets {
-		path, err := c.SourceResolver.Resolve(policySet)
+		path, resolveErr := c.SourceResolver.Resolve(policySet)
 
 		// Let's not fail the whole step because of a single failure. Log and fail silently
-		if err != nil {
-			ctx.Log.Err("Error resolving policyset %s. err: %s", policySet.Name, err.Error())
+		if resolveErr != nil {
+			ctx.Log.Err("Error resolving policyset %s. err: %s", policySet.Name, resolveErr.Error())
 			continue
 		}
 
-		policyArg := NewPolicyArg(path)
-		policyArgs = append(policyArgs, policyArg)
+		args := ConftestTestCommandArgs{
+			PolicyArgs: []Arg{NewPolicyArg(path)},
+			ExtraArgs:  extraArgs,
+			InputFile:  inputFile,
+			Command:    executablePath,
+		}
 
-		policySetNames = append(policySetNames, policySet.Name)
+		serializedArgs, _ := args.build()
+		cmdOutput, cmdErr := c.Exec.CombinedOutput(serializedArgs, envs, workdir)
+
+		if cmdErr != nil {
+			// Since we're running conftest for each policyset, individual command errors should be concatenated.
+			if isValidConftestOutput(cmdOutput) {
+				combinedErr = errors.Join(combinedErr, fmt.Errorf("policy_set: %s: conftest: some policies failed", policySet.Name))
+			} else {
+				combinedErr = errors.Join(combinedErr, fmt.Errorf("policy_set: %s: conftest: %s", policySet.Name, cmdOutput))
+			}
+		}
+
+		passed := true
+		if cmdErr != nil || hasFailures(cmdOutput) {
+			passed = false
+		}
+
+		policySetResults = append(policySetResults, models.PolicySetResult{
+			PolicySetName: policySet.Name,
+			PolicyOutput:  cmdOutput,
+			Passed:        passed,
+			ReqApprovals:  policySet.ApproveCount,
+		})
 	}
 
-	inputFile := filepath.Join(workdir, ctx.GetShowResultFileName())
-
-	args := ConftestTestCommandArgs{
-		PolicyArgs: policyArgs,
-		ExtraArgs:  extraArgs,
-		InputFile:  inputFile,
-		Command:    executablePath,
-	}
-
-	serializedArgs, err := args.build()
-
-	if err != nil {
-		ctx.Log.Warn("No policies have been configured")
+	if policySetResults == nil {
+		ctx.Log.Warn("no policies have been configured.")
 		return "", nil
 		// TODO: enable when we can pass policies in otherwise e2e tests with policy checks fail
 		// return "", errors.Wrap(err, "building args")
 	}
 
-	initialOutput := fmt.Sprintf("Checking plan against the following policies: \n  %s\n", strings.Join(policySetNames, "\n  "))
-	cmdOutput, err := c.Exec.CombinedOutput(serializedArgs, envs, workdir)
+	marshaledStatus, err := json.Marshal(policySetResults)
+	if err != nil {
+		return "", errors.New("cannot marshal data into []PolicySetResult. data")
+	}
 
-	return c.sanitizeOutput(inputFile, initialOutput+cmdOutput), err
+	// Write policy check results to a file which can be used by custom workflow run steps for metrics, notifications, etc.
+	policyCheckResultFile := filepath.Join(workdir, ctx.GetPolicyCheckResultFileName())
+	err = os.WriteFile(policyCheckResultFile, marshaledStatus, 0600)
+
+	combinedErr = errors.Join(combinedErr, err)
+
+	output := string(marshaledStatus)
+
+	return c.sanitizeOutput(inputFile, output), combinedErr
 
 }
 
 func (c *ConfTestExecutorWorkflow) sanitizeOutput(inputFile string, output string) string {
-	return strings.Replace(output, inputFile, "<redacted plan file>", -1)
+	return strings.ReplaceAll(output, inputFile, "<redacted plan file>")
 }
 
 func (c *ConfTestExecutorWorkflow) EnsureExecutorVersion(log logging.SimpleLogging, v *version.Version) (string, error) {
-	// we have no information to proceed so fail hard
+	// we have no information to proceed, so fallback to `conftest` command or fail hard
 	if c.DefaultConftestVersion == nil && v == nil {
-		return "", errors.New("no conftest version configured/specified")
+		localPath, err := c.Exec.LookPath(conftestBinaryName)
+		if err == nil {
+			log.Info("conftest version is not specified, so fallback to conftest command")
+			return localPath, nil
+		}
+		return "", errors.New("no conftest version configured/specified or not found conftest command")
 	}
 
 	var versionToRetrieve *version.Version
@@ -243,7 +304,43 @@ func getDefaultVersion() (*version.Version, error) {
 	wrappedVersion, err := version.NewVersion(defaultVersion)
 
 	if err != nil {
-		return nil, errors.Wrapf(err, "wrapping version %s", defaultVersion)
+		return nil, fmt.Errorf("wrapping version %s: %w", defaultVersion, err)
 	}
 	return wrappedVersion, nil
+}
+
+// Checks if output from conftest is a valid output.
+func isValidConftestOutput(output string) bool {
+
+	r := regexp.MustCompile(`^(WARN|FAIL|\[)`)
+	if match := r.FindString(output); match != "" {
+		return true
+	}
+	return false
+}
+
+// hasFailures checks whether any conftest policies have failed
+func hasFailures(output string) bool {
+	r := regexp.MustCompile(`([1-9]([0-9]?)* failure|failures": \[)`)
+	if match := r.FindString(output); match != "" {
+		return true
+	}
+	return false
+}
+
+func getPlatform() string {
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+
+	switch platform {
+	case "linux_amd64":
+		return "Linux_x86_64"
+	case "linux_arm64":
+		return "Linux_arm64"
+	case "darwin_amd64":
+		return "Darwin_x86_64"
+	case "darwin_arm64":
+		return "Darwin_arm64"
+	default:
+		return ""
+	}
 }

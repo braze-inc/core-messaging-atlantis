@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw
 
 import (
@@ -6,7 +9,11 @@ import (
 
 // DefaultAutoPlanWhenModified is the default element in the when_modified
 // list if none is defined.
-var DefaultAutoPlanWhenModified = []string{"**/*.tf*", "**/terragrunt.hcl"}
+var DefaultAutoPlanWhenModified = []string{
+	"**/*.tf*",
+	"**/terragrunt.hcl",
+	"**/.terraform.lock.hcl",
+}
 
 type Autoplan struct {
 	WhenModified []string `yaml:"when_modified,omitempty"`

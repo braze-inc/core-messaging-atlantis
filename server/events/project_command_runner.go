@@ -14,16 +14,19 @@
 package events
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/events/vcs"
 	"github.com/runatlantis/atlantis/server/events/webhooks"
 	"github.com/runatlantis/atlantis/server/logging"
 )
@@ -40,7 +43,7 @@ func (d DirNotExistErr) Error() string {
 	return fmt.Sprintf("dir %q does not exist", d.RepoRelDir)
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_lock_url_generator.go LockURLGenerator
+//go:generate pegomock generate --package mocks -o mocks/mock_lock_url_generator.go LockURLGenerator
 
 // LockURLGenerator generates urls to locks.
 type LockURLGenerator interface {
@@ -48,7 +51,7 @@ type LockURLGenerator interface {
 	GenerateLockURL(lockID string) string
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_step_runner.go StepRunner
+//go:generate pegomock generate --package mocks -o mocks/mock_step_runner.go StepRunner
 
 // StepRunner runs steps. Steps are individual pieces of execution like
 // `terraform plan`.
@@ -57,28 +60,51 @@ type StepRunner interface {
 	Run(ctx command.ProjectContext, extraArgs []string, path string, envs map[string]string) (string, error)
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_custom_step_runner.go CustomStepRunner
+//go:generate pegomock generate --package mocks -o mocks/mock_custom_step_runner.go CustomStepRunner
 
 // CustomStepRunner runs custom run steps.
 type CustomStepRunner interface {
 	// Run cmd in path.
-	Run(ctx command.ProjectContext, cmd string, path string, envs map[string]string, streamOutput bool) (string, error)
+	Run(
+		ctx command.ProjectContext,
+		shell *valid.CommandShell,
+		cmd string,
+		path string,
+		envs map[string]string,
+		streamOutput bool,
+		postProcessOutput []valid.PostProcessRunOutputOption,
+		postProcessFilterRegexes []*regexp.Regexp,
+	) (string, error)
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_env_step_runner.go EnvStepRunner
+//go:generate pegomock generate --package mocks -o mocks/mock_env_step_runner.go EnvStepRunner
 
 // EnvStepRunner runs env steps.
 type EnvStepRunner interface {
-	Run(ctx command.ProjectContext, cmd string, value string, path string, envs map[string]string) (string, error)
+	Run(
+		ctx command.ProjectContext,
+		shell *valid.CommandShell,
+		cmd string,
+		value string,
+		path string,
+		envs map[string]string,
+	) (string, error)
 }
 
 // MultiEnvStepRunner runs multienv steps.
 type MultiEnvStepRunner interface {
 	// Run cmd in path.
-	Run(ctx command.ProjectContext, cmd string, path string, envs map[string]string) (string, error)
+	Run(
+		ctx command.ProjectContext,
+		shell *valid.CommandShell,
+		cmd string,
+		path string,
+		envs map[string]string,
+		postProcessOutput []valid.PostProcessRunOutputOption,
+	) (string, error)
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_webhooks_sender.go WebhooksSender
+//go:generate pegomock generate --package mocks -o mocks/mock_webhooks_sender.go WebhooksSender
 
 // WebhooksSender sends webhook.
 type WebhooksSender interface {
@@ -86,31 +112,41 @@ type WebhooksSender interface {
 	Send(log logging.SimpleLogging, res webhooks.ApplyResult) error
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_project_command_runner.go ProjectCommandRunner
+//go:generate pegomock generate --package mocks -o mocks/mock_project_command_runner.go ProjectCommandRunner
 
 type ProjectPlanCommandRunner interface {
 	// Plan runs terraform plan for the project described by ctx.
-	Plan(ctx command.ProjectContext) command.ProjectResult
+	Plan(ctx command.ProjectContext) command.ProjectCommandOutput
 }
 
 type ProjectApplyCommandRunner interface {
 	// Apply runs terraform apply for the project described by ctx.
-	Apply(ctx command.ProjectContext) command.ProjectResult
+	Apply(ctx command.ProjectContext) command.ProjectCommandOutput
 }
 
 type ProjectPolicyCheckCommandRunner interface {
-	// PolicyCheck runs OPA defined policies for the project desribed by ctx.
-	PolicyCheck(ctx command.ProjectContext) command.ProjectResult
+	// PolicyCheck runs OPA defined policies for the project described by ctx.
+	PolicyCheck(ctx command.ProjectContext) command.ProjectCommandOutput
 }
 
 type ProjectApprovePoliciesCommandRunner interface {
 	// Approves any failing OPA policies.
-	ApprovePolicies(ctx command.ProjectContext) command.ProjectResult
+	ApprovePolicies(ctx command.ProjectContext) command.ProjectCommandOutput
 }
 
 type ProjectVersionCommandRunner interface {
 	// Version runs terraform version for the project described by ctx.
-	Version(ctx command.ProjectContext) command.ProjectResult
+	Version(ctx command.ProjectContext) command.ProjectCommandOutput
+}
+
+type ProjectImportCommandRunner interface {
+	// Import runs terraform import for the project described by ctx.
+	Import(ctx command.ProjectContext) command.ProjectCommandOutput
+}
+
+type ProjectStateCommandRunner interface {
+	// StateRm runs terraform state rm for the project described by ctx.
+	StateRm(ctx command.ProjectContext) command.ProjectCommandOutput
 }
 
 // ProjectCommandRunner runs project commands. A project command is a command
@@ -121,17 +157,19 @@ type ProjectCommandRunner interface {
 	ProjectPolicyCheckCommandRunner
 	ProjectApprovePoliciesCommandRunner
 	ProjectVersionCommandRunner
+	ProjectImportCommandRunner
+	ProjectStateCommandRunner
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_job_url_setter.go JobURLSetter
+//go:generate pegomock generate --package mocks -o mocks/mock_job_url_setter.go JobURLSetter
 
 type JobURLSetter interface {
 	// SetJobURLWithStatus sets the commit status for the project represented by
 	// ctx and updates the status with and url to a job.
-	SetJobURLWithStatus(ctx command.ProjectContext, cmdName command.Name, status models.CommitStatus) error
+	SetJobURLWithStatus(ctx command.ProjectContext, cmdName command.Name, status models.CommitStatus, res *command.ProjectCommandOutput) error
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_job_message_sender.go JobMessageSender
+//go:generate pegomock generate --package mocks -o mocks/mock_job_message_sender.go JobMessageSender
 
 type JobMessageSender interface {
 	Send(ctx command.ProjectContext, msg string, operationComplete bool)
@@ -145,23 +183,23 @@ type ProjectOutputWrapper struct {
 	JobURLSetter     JobURLSetter
 }
 
-func (p *ProjectOutputWrapper) Plan(ctx command.ProjectContext) command.ProjectResult {
+func (p *ProjectOutputWrapper) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
 	result := p.updateProjectPRStatus(command.Plan, ctx, p.ProjectCommandRunner.Plan)
 	p.JobMessageSender.Send(ctx, "", OperationComplete)
 	return result
 }
 
-func (p *ProjectOutputWrapper) Apply(ctx command.ProjectContext) command.ProjectResult {
+func (p *ProjectOutputWrapper) Apply(ctx command.ProjectContext) command.ProjectCommandOutput {
 	result := p.updateProjectPRStatus(command.Apply, ctx, p.ProjectCommandRunner.Apply)
 	p.JobMessageSender.Send(ctx, "", OperationComplete)
 	return result
 }
 
-func (p *ProjectOutputWrapper) updateProjectPRStatus(commandName command.Name, ctx command.ProjectContext, execute func(ctx command.ProjectContext) command.ProjectResult) command.ProjectResult {
+func (p *ProjectOutputWrapper) updateProjectPRStatus(commandName command.Name, ctx command.ProjectContext, execute func(ctx command.ProjectContext) command.ProjectCommandOutput) command.ProjectCommandOutput {
 	// Create a PR status to track project's plan status. The status will
 	// include a link to view the progress of atlantis plan command in real
 	// time
-	if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.PendingCommitStatus); err != nil {
+	if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.PendingCommitStatus, nil); err != nil {
 		ctx.Log.Err("updating project PR status", err)
 	}
 
@@ -169,14 +207,14 @@ func (p *ProjectOutputWrapper) updateProjectPRStatus(commandName command.Name, c
 	result := execute(ctx)
 
 	if result.Error != nil || result.Failure != "" {
-		if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.FailedCommitStatus); err != nil {
+		if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.FailedCommitStatus, &result); err != nil {
 			ctx.Log.Err("updating project PR status", err)
 		}
 
 		return result
 	}
 
-	if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.SuccessCommitStatus); err != nil {
+	if err := p.JobURLSetter.SetJobURLWithStatus(ctx, commandName, models.SuccessCommitStatus, &result); err != nil {
 		ctx.Log.Err("updating project PR status", err)
 	}
 
@@ -185,113 +223,103 @@ func (p *ProjectOutputWrapper) updateProjectPRStatus(commandName command.Name, c
 
 // DefaultProjectCommandRunner implements ProjectCommandRunner.
 type DefaultProjectCommandRunner struct {
-	Locker                     ProjectLocker
-	LockURLGenerator           LockURLGenerator
-	InitStepRunner             StepRunner
-	PlanStepRunner             StepRunner
-	ShowStepRunner             StepRunner
-	ApplyStepRunner            StepRunner
-	PolicyCheckStepRunner      StepRunner
-	VersionStepRunner          StepRunner
-	RunStepRunner              CustomStepRunner
-	EnvStepRunner              EnvStepRunner
-	MultiEnvStepRunner         MultiEnvStepRunner
-	PullApprovedChecker        runtime.PullApprovedChecker
-	WorkingDir                 WorkingDir
-	Webhooks                   WebhooksSender
-	WorkingDirLocker           WorkingDirLocker
-	AggregateApplyRequirements ApplyRequirement
+	VcsClient                 vcs.Client
+	Locker                    ProjectLocker
+	LockURLGenerator          LockURLGenerator
+	Logger                    logging.SimpleLogging
+	InitStepRunner            StepRunner
+	PlanStepRunner            StepRunner
+	ShowStepRunner            StepRunner
+	ApplyStepRunner           StepRunner
+	CancelStepRunner          StepRunner
+	PolicyCheckStepRunner     StepRunner
+	VersionStepRunner         StepRunner
+	ImportStepRunner          StepRunner
+	StateRmStepRunner         StepRunner
+	RunStepRunner             CustomStepRunner
+	EnvStepRunner             EnvStepRunner
+	MultiEnvStepRunner        MultiEnvStepRunner
+	PullApprovedChecker       runtime.PullApprovedChecker
+	WorkingDir                WorkingDir
+	Webhooks                  WebhooksSender
+	WorkingDirLocker          WorkingDirLocker
+	CommandRequirementHandler CommandRequirementHandler
+	CancellationTracker       CancellationTracker
 }
 
 // Plan runs terraform plan for the project described by ctx.
-func (p *DefaultProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectResult {
+func (p *DefaultProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
 	planSuccess, failure, err := p.doPlan(ctx)
-	return command.ProjectResult{
-		Command:     command.Plan,
+	return command.ProjectCommandOutput{
 		PlanSuccess: planSuccess,
 		Error:       err,
 		Failure:     failure,
-		RepoRelDir:  ctx.RepoRelDir,
-		Workspace:   ctx.Workspace,
-		ProjectName: ctx.ProjectName,
 	}
 }
 
 // PolicyCheck evaluates policies defined with Rego for the project described by ctx.
-func (p *DefaultProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) command.ProjectResult {
+func (p *DefaultProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) command.ProjectCommandOutput {
 	policySuccess, failure, err := p.doPolicyCheck(ctx)
-	return command.ProjectResult{
-		Command:            command.PolicyCheck,
-		PolicyCheckSuccess: policySuccess,
+	return command.ProjectCommandOutput{
+		PolicyCheckResults: policySuccess,
 		Error:              err,
 		Failure:            failure,
-		RepoRelDir:         ctx.RepoRelDir,
-		Workspace:          ctx.Workspace,
-		ProjectName:        ctx.ProjectName,
 	}
 }
 
 // Apply runs terraform apply for the project described by ctx.
-func (p *DefaultProjectCommandRunner) Apply(ctx command.ProjectContext) command.ProjectResult {
+func (p *DefaultProjectCommandRunner) Apply(ctx command.ProjectContext) command.ProjectCommandOutput {
 	applyOut, failure, err := p.doApply(ctx)
-	return command.ProjectResult{
-		Command:      command.Apply,
+	return command.ProjectCommandOutput{
 		Failure:      failure,
 		Error:        err,
 		ApplySuccess: applyOut,
-		RepoRelDir:   ctx.RepoRelDir,
-		Workspace:    ctx.Workspace,
-		ProjectName:  ctx.ProjectName,
 	}
 }
 
-func (p *DefaultProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext) command.ProjectResult {
+func (p *DefaultProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext) command.ProjectCommandOutput {
 	approvedOut, failure, err := p.doApprovePolicies(ctx)
-	return command.ProjectResult{
-		Command:            command.PolicyCheck,
+	return command.ProjectCommandOutput{
 		Failure:            failure,
 		Error:              err,
-		PolicyCheckSuccess: approvedOut,
-		RepoRelDir:         ctx.RepoRelDir,
-		Workspace:          ctx.Workspace,
-		ProjectName:        ctx.ProjectName,
+		PolicyCheckResults: approvedOut,
 	}
 }
 
-func (p *DefaultProjectCommandRunner) Version(ctx command.ProjectContext) command.ProjectResult {
+func (p *DefaultProjectCommandRunner) Version(ctx command.ProjectContext) command.ProjectCommandOutput {
 	versionOut, failure, err := p.doVersion(ctx)
-	return command.ProjectResult{
-		Command:        command.Version,
+	return command.ProjectCommandOutput{
 		Failure:        failure,
 		Error:          err,
 		VersionSuccess: versionOut,
-		RepoRelDir:     ctx.RepoRelDir,
-		Workspace:      ctx.Workspace,
-		ProjectName:    ctx.ProjectName,
 	}
 }
 
-func (p *DefaultProjectCommandRunner) doApprovePolicies(ctx command.ProjectContext) (*models.PolicyCheckSuccess, string, error) {
-
-	// TODO: Make this a bit smarter
-	// without checking some sort of state that the policy check has indeed passed this is likely to cause issues
-
-	return &models.PolicyCheckSuccess{
-		PolicyCheckOutput: "Policies approved",
-	}, "", nil
+// Import runs terraform import for the project described by ctx.
+func (p *DefaultProjectCommandRunner) Import(ctx command.ProjectContext) command.ProjectCommandOutput {
+	importSuccess, failure, err := p.doImport(ctx)
+	return command.ProjectCommandOutput{
+		ImportSuccess: importSuccess,
+		Error:         err,
+		Failure:       failure,
+	}
 }
 
-func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) (*models.PolicyCheckSuccess, string, error) {
-	// Acquire Atlantis lock for this repo/dir/workspace.
-	// This should already be acquired from the prior plan operation.
-	// if for some reason an unlock happens between the plan and policy check step
-	// we will attempt to capture the lock here but fail to get the working directory
-	// at which point we will unlock again to preserve functionality
-	// If we fail to capture the lock here (super unlikely) then we error out and the user is forced to replan
-	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir))
+// StateRm runs terraform state rm for the project described by ctx.
+func (p *DefaultProjectCommandRunner) StateRm(ctx command.ProjectContext) command.ProjectCommandOutput {
+	stateRmSuccess, failure, err := p.doStateRm(ctx)
+	return command.ProjectCommandOutput{
+		StateRmSuccess: stateRmSuccess,
+		Error:          err,
+		Failure:        failure,
+	}
+}
 
+func (p *DefaultProjectCommandRunner) doApprovePolicies(ctx command.ProjectContext) (*models.PolicyCheckResults, string, error) {
+	// Acquire Atlantis lock for this repo/dir/workspace.
+	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), ctx.RepoLocksMode == valid.RepoLocksOnPlanMode)
 	if err != nil {
-		return nil, "", errors.Wrap(err, "acquiring lock")
+		return nil, "", fmt.Errorf("acquiring lock: %w", err)
 	}
 	if !lockAttempt.LockAcquired {
 		return nil, lockAttempt.LockFailureReason, nil
@@ -299,9 +327,111 @@ func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) 
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.ApprovePolicies)
+	if err != nil {
+		return nil, "", err
+	}
+	defer unlockFn()
+
+	teams := []string{}
+
+	policySetCfg := ctx.PolicySets
+
+	// Only query the users team membership if any teams have been configured as owners on any policy set(s).
+	if policySetCfg.HasTeamOwners() {
+		// A convenient way to access vcsClient. Not sure if best way.
+		userTeams, err := p.VcsClient.GetTeamNamesForUser(p.Logger, ctx.Pull.BaseRepo, ctx.User)
+		if err != nil {
+			ctx.Log.Err("unable to get team membership for user: %s", err)
+			return nil, "", err
+		}
+		teams = append(teams, userTeams...)
+	}
+	isAdmin := policySetCfg.Owners.IsOwner(ctx.User.Username, teams)
+
+	var failure string
+
+	// Run over each policy set for the project and perform appropriate approval.
+	var prjPolicySetResults []models.PolicySetResult
+	var prjErr error
+	allPassed := true
+	for _, policySet := range policySetCfg.PolicySets {
+		isOwner := policySet.Owners.IsOwner(ctx.User.Username, teams) || isAdmin
+		prjPolicyStatus := ctx.ProjectPolicyStatus
+		for i, policyStatus := range prjPolicyStatus {
+			ignorePolicy := false
+			if policySet.Name == policyStatus.PolicySetName {
+				// Policy set either passed or has sufficient approvals. Move on.
+				if policyStatus.Passed || (policyStatus.Approvals == policySet.ApproveCount) {
+					if !ctx.ClearPolicyApproval {
+						ignorePolicy = true
+					}
+				}
+				// Set ignore flag if targeted policy does not match.
+				if ctx.PolicySetTarget != "" && (ctx.PolicySetTarget != policySet.Name) {
+					ignorePolicy = true
+				}
+				// Increment approval if user is owner.
+				if isOwner && !ignorePolicy && (ctx.User.Username != ctx.Pull.Author || !policySet.PreventSelfApprove) {
+					if !ctx.ClearPolicyApproval {
+						prjPolicyStatus[i].Approvals = policyStatus.Approvals + 1
+					} else {
+						prjPolicyStatus[i].Approvals = 0
+					}
+					// User matches the author and prevent self approve is set to true
+				} else if isOwner && !ignorePolicy && ctx.User.Username == ctx.Pull.Author && policySet.PreventSelfApprove {
+					prjErr = errors.Join(prjErr, fmt.Errorf("policy set: %s the author of pr %s matches the command commenter user %s - please contact another policy owners to approve failing policies", policySet.Name, ctx.Pull.Author, ctx.User.Username))
+					// User is not authorized to approve policy set.
+				} else if !ignorePolicy {
+					prjErr = errors.Join(prjErr, fmt.Errorf("policy set: %s user %s is not a policy owner - please contact policy owners to approve failing policies", policySet.Name, ctx.User.Username))
+				}
+				// Still bubble up this failure, even if policy set is not targeted.
+				if !policyStatus.Passed && (prjPolicyStatus[i].Approvals != policySet.ApproveCount) {
+					allPassed = false
+				}
+
+				prjPolicySetResults = append(prjPolicySetResults, models.PolicySetResult{
+					PolicySetName: policySet.Name,
+					Passed:        policyStatus.Passed,
+					CurApprovals:  prjPolicyStatus[i].Approvals,
+					ReqApprovals:  policySet.ApproveCount,
+				})
+			}
+		}
+	}
+	if !allPassed {
+		failure = `One or more policy sets require additional approval.`
+	}
+	return &models.PolicyCheckResults{
+		LockURL:            p.LockURLGenerator.GenerateLockURL(lockAttempt.LockKey),
+		PolicySetResults:   prjPolicySetResults,
+		ApplyCmd:           ctx.ApplyCmd,
+		RePlanCmd:          ctx.RePlanCmd,
+		ApprovePoliciesCmd: ctx.ApprovePoliciesCmd,
+	}, failure, prjErr
+}
+
+func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) (*models.PolicyCheckResults, string, error) {
+	// Acquire Atlantis lock for this repo/dir/workspace.
+	// This should already be acquired from the prior plan operation.
+	// if for some reason an unlock happens between the plan and policy check step
+	// we will attempt to capture the lock here but fail to get the working directory
+	// at which point we will unlock again to preserve functionality
+	// If we fail to capture the lock here (super unlikely) then we error out and the user is forced to replan
+	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), ctx.RepoLocksMode == valid.RepoLocksOnPlanMode)
+
+	if err != nil {
+		return nil, "", fmt.Errorf("acquiring lock: %w", err)
+	}
+	if !lockAttempt.LockAcquired {
+		return nil, lockAttempt.LockFailureReason, nil
+	}
+	ctx.Log.Debug("acquired lock for project.")
+
+	// Acquire internal lock for the directory we're going to operate in.
 	// We should refactor this to keep the lock for the duration of plan and policy check since as of now
 	// there is a small gap where we don't have the lock and if we can't get this here, we should just unlock the PR.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir)
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.PolicyCheck)
 	if err != nil {
 		return nil, "", err
 	}
@@ -333,30 +463,138 @@ func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) 
 		return nil, "", DirNotExistErr{RepoRelDir: ctx.RepoRelDir}
 	}
 
+	var failure string
 	outputs, err := p.runSteps(ctx.Steps, ctx, absPath)
+	var errs error
 	if err != nil {
-		// Note: we are explicitly not unlocking the pr here since a failing policy check will require
-		// approval
-		return nil, "", fmt.Errorf("%s\n%s", err, strings.Join(outputs, "\n"))
+		for {
+			err = errors.Unwrap(err)
+			if err == nil {
+				break
+			}
+			// Exclude errors for failed policies
+			if !strings.Contains(err.Error(), "some policies failed") {
+				errs = errors.Join(errs, err)
+			}
+		}
+
+		if errs != nil {
+			// Note: we are explicitly not unlocking the pr here since a failing policy check will require
+			// approval
+			return nil, "", errs
+		}
 	}
 
-	return &models.PolicyCheckSuccess{
-		LockURL:           p.LockURLGenerator.GenerateLockURL(lockAttempt.LockKey),
-		PolicyCheckOutput: strings.Join(outputs, "\n"),
-		RePlanCmd:         ctx.RePlanCmd,
-		ApplyCmd:          ctx.ApplyCmd,
+	// Separate output from custom run steps
+	var index int
+	var preConftestOutput []string
+	var postConftestOutput []string
+	// Initialize policySetResults as empty slice instead of nil to prevent
+	// "unable to unmarshal conftest output" error when outputs array is empty
+	policySetResults := []models.PolicySetResult{}
 
-		// set this to false right now because we don't have this information
-		// TODO: refactor the templates in a sane way so we don't need this
-		HasDiverged: false,
-	}, "", nil
+	inputPolicySets := ctx.PolicySets.PolicySets
+	for index, output := range outputs {
+		if !ctx.CustomPolicyCheck {
+			err = json.Unmarshal([]byte(strings.Join([]string{output}, "\n")), &policySetResults)
+			if err == nil {
+				break
+			}
+			preConftestOutput = append(preConftestOutput, output)
+		} else {
+			// Using a policy tool other than Conftest, manually building result struct
+			policySetName := "Custom"
+			if index < len(inputPolicySets) {
+				policySetName = inputPolicySets[index].Name
+			}
+
+			// Handle empty output: treat as failure since it likely indicates misconfiguration
+			// Non-empty output: parse conftest-style output to determine pass/fail
+			// Check for actual failures (> 0), not just the word "fail"
+			var passed bool
+			var policyOutput string
+			if output == "" {
+				passed = false
+				policyOutput = "WARNING: Policy check produced no output. This may indicate a misconfiguration."
+			} else {
+				// Use regex to check for actual failures (> 0), not just the word "fail"
+				// Matches patterns like "1 failure", "2 failures", "10 failures", or JSON "failures": [...]
+				failureRegex := regexp.MustCompile(`([1-9][0-9]* failure|failures": \[)`)
+				hasFailures := failureRegex.MatchString(output)
+				// Also check for FAIL prefix (conftest error output)
+				hasFailPrefix := strings.HasPrefix(strings.TrimSpace(output), "FAIL")
+				passed = !hasFailures && !hasFailPrefix
+				policyOutput = output
+			}
+
+			policySetResults = append(policySetResults, models.PolicySetResult{PolicySetName: policySetName, PolicyOutput: policyOutput, Passed: passed, ReqApprovals: 1, CurApprovals: 0})
+			preConftestOutput = append(preConftestOutput, "")
+		}
+	}
+
+	// Warn if custom policy check has mismatch between configured policy sets and outputs.
+	// Note: With empty output preservation, this warning now only triggers when workflow steps
+	// are completely missing, not when a step returns empty output.
+	if ctx.CustomPolicyCheck {
+		if len(policySetResults) < len(inputPolicySets) {
+			ctx.Log.Warn("Configured %d policy sets but only received %d outputs. Policy sets without outputs: %v. Check your workflow configuration.",
+				len(inputPolicySets),
+				len(policySetResults),
+				getMissingPolicySetNames(inputPolicySets, len(policySetResults)))
+		} else if len(policySetResults) > len(inputPolicySets) {
+			ctx.Log.Warn("Received %d outputs but only %d policy sets configured. Excess outputs will use 'Custom' as name.",
+				len(policySetResults),
+				len(inputPolicySets))
+		}
+	}
+
+	// Check if we have any policy check results
+	// For non-custom policy checks (conftest), empty results means JSON parsing failed
+	// For custom policy checks, empty results when policy sets are configured means the check failed
+	if len(policySetResults) == 0 {
+		if !ctx.CustomPolicyCheck {
+			// Conftest should have produced JSON output
+			return nil, "", errors.New("unable to unmarshal conftest output")
+		} else if len(inputPolicySets) > 0 {
+			// Custom policy check with configured policy sets but no results - this is a failure
+			return nil, "", errors.New("custom policy check produced no results despite configured policy sets")
+		}
+		// Custom policy check with no configured policy sets and no results - this is OK
+	}
+
+	if len(outputs) > 0 {
+		postConftestOutput = outputs[(index + 1):]
+	}
+
+	result := &models.PolicyCheckResults{
+		LockURL:            p.LockURLGenerator.GenerateLockURL(lockAttempt.LockKey),
+		PreConftestOutput:  strings.Join(preConftestOutput, "\n"),
+		PostConftestOutput: strings.Join(postConftestOutput, "\n"),
+		PolicySetResults:   policySetResults,
+		RePlanCmd:          ctx.RePlanCmd,
+		ApplyCmd:           ctx.ApplyCmd,
+		ApprovePoliciesCmd: ctx.ApprovePoliciesCmd,
+	}
+
+	// Using this function instead of catching failed policy runs with errors, for cases when '--no-fail' is passed to conftest.
+	// One reason to pass such an arg to conftest would be to prevent workflow termination so custom run scripts
+	// can be run after the conftest step.
+	// Only log outputs as errors if policies did not pass, otherwise log at debug level
+	if !result.PolicyCleared() {
+		ctx.Log.Err(strings.Join(outputs, "\n"))
+		failure = "Some policy sets did not pass."
+	} else {
+		ctx.Log.Debug("policy check outputs %s", strings.Join(outputs, "\n"))
+	}
+
+	return result, failure, nil
 }
 
 func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*models.PlanSuccess, string, error) {
 	// Acquire Atlantis lock for this repo/dir/workspace.
-	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir))
+	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), ctx.RepoLocksMode == valid.RepoLocksOnPlanMode)
 	if err != nil {
-		return nil, "", errors.Wrap(err, "acquiring lock")
+		return nil, "", fmt.Errorf("acquiring lock: %w", err)
 	}
 	if !lockAttempt.LockAcquired {
 		return nil, lockAttempt.LockFailureReason, nil
@@ -364,23 +602,36 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir)
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Plan)
 	if err != nil {
 		return nil, "", err
 	}
 	defer unlockFn()
 
 	// Clone is idempotent so okay to run even if the repo was already cloned.
-	repoDir, hasDiverged, cloneErr := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
-	if cloneErr != nil {
+	repoDir, err := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
+	if err != nil {
 		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
 			ctx.Log.Err("error unlocking state after plan error: %v", unlockErr)
 		}
-		return nil, "", cloneErr
+		return nil, "", err
 	}
+	mergedAgain, err := p.WorkingDir.MergeAgain(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
+	if err != nil {
+		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+			ctx.Log.Err("error unlocking state after plan error: %v", unlockErr)
+		}
+		return nil, "", err
+	}
+
 	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if _, err = os.Stat(projAbsPath); os.IsNotExist(err) {
 		return nil, "", DirNotExistErr{RepoRelDir: ctx.RepoRelDir}
+	}
+
+	failure, err := p.CommandRequirementHandler.ValidatePlanProject(repoDir, ctx)
+	if failure != "" || err != nil {
+		return nil, failure, err
 	}
 
 	outputs, err := p.runSteps(ctx.Steps, ctx, projAbsPath)
@@ -397,7 +648,7 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
 		TerraformOutput: strings.Join(outputs, "\n"),
 		RePlanCmd:       ctx.RePlanCmd,
 		ApplyCmd:        ctx.ApplyCmd,
-		HasDiverged:     hasDiverged,
+		MergedAgain:     mergedAgain,
 	}, "", nil
 }
 
@@ -414,13 +665,28 @@ func (p *DefaultProjectCommandRunner) doApply(ctx command.ProjectContext) (apply
 		return "", "", DirNotExistErr{RepoRelDir: ctx.RepoRelDir}
 	}
 
-	failure, err = p.AggregateApplyRequirements.ValidateProject(repoDir, ctx)
+	failure, err = p.CommandRequirementHandler.ValidateApplyProject(repoDir, ctx)
 	if failure != "" || err != nil {
 		return "", failure, err
 	}
 
+	failure, err = p.CommandRequirementHandler.ValidateProjectDependencies(ctx)
+	if failure != "" || err != nil {
+		return "", failure, err
+	}
+
+	// Acquire Atlantis lock for this repo/dir/workspace.
+	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), ctx.RepoLocksMode == valid.RepoLocksOnApplyMode)
+	if err != nil {
+		return "", "", fmt.Errorf("acquiring lock: %w", err)
+	}
+	if !lockAttempt.LockAcquired {
+		return "", lockAttempt.LockFailureReason, nil
+	}
+	ctx.Log.Debug("acquired lock for project")
+
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir)
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Apply)
 	if err != nil {
 		return "", "", err
 	}
@@ -429,12 +695,13 @@ func (p *DefaultProjectCommandRunner) doApply(ctx command.ProjectContext) (apply
 	outputs, err := p.runSteps(ctx.Steps, ctx, absPath)
 
 	p.Webhooks.Send(ctx.Log, webhooks.ApplyResult{ // nolint: errcheck
-		Workspace: ctx.Workspace,
-		User:      ctx.User,
-		Repo:      ctx.Pull.BaseRepo,
-		Pull:      ctx.Pull,
-		Success:   err == nil,
-		Directory: ctx.RepoRelDir,
+		Workspace:   ctx.Workspace,
+		User:        ctx.User,
+		Repo:        ctx.Pull.BaseRepo,
+		Pull:        ctx.Pull,
+		Success:     err == nil,
+		Directory:   ctx.RepoRelDir,
+		ProjectName: ctx.ProjectName,
 	})
 
 	if err != nil {
@@ -458,7 +725,7 @@ func (p *DefaultProjectCommandRunner) doVersion(ctx command.ProjectContext) (ver
 	}
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir)
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Version)
 	if err != nil {
 		return "", "", err
 	}
@@ -470,6 +737,93 @@ func (p *DefaultProjectCommandRunner) doVersion(ctx command.ProjectContext) (ver
 	}
 
 	return strings.Join(outputs, "\n"), "", nil
+}
+
+func (p *DefaultProjectCommandRunner) doImport(ctx command.ProjectContext) (out *models.ImportSuccess, failure string, err error) {
+	// Clone is idempotent so okay to run even if the repo was already cloned.
+	repoDir, cloneErr := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
+	if cloneErr != nil {
+		return nil, "", cloneErr
+	}
+	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
+	if _, err = os.Stat(projAbsPath); os.IsNotExist(err) {
+		return nil, "", DirNotExistErr{RepoRelDir: ctx.RepoRelDir}
+	}
+
+	failure, err = p.CommandRequirementHandler.ValidateImportProject(repoDir, ctx)
+	if failure != "" || err != nil {
+		return nil, failure, err
+	}
+
+	// Acquire Atlantis lock for this repo/dir/workspace.
+	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), ctx.RepoLocksMode != valid.RepoLocksDisabledMode)
+	if err != nil {
+		return nil, "", fmt.Errorf("acquiring lock: %w", err)
+	}
+	if !lockAttempt.LockAcquired {
+		return nil, lockAttempt.LockFailureReason, nil
+	}
+	ctx.Log.Debug("acquired lock for project")
+
+	// Acquire internal lock for the directory we're going to operate in.
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Import)
+	if err != nil {
+		return nil, "", err
+	}
+	defer unlockFn()
+
+	outputs, err := p.runSteps(ctx.Steps, ctx, projAbsPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s\n%s", err, strings.Join(outputs, "\n"))
+	}
+
+	// after import, re-plan command is required without import args
+	rePlanCmd := strings.TrimSpace(strings.Split(ctx.RePlanCmd, "--")[0])
+	return &models.ImportSuccess{
+		Output:    strings.Join(outputs, "\n"),
+		RePlanCmd: rePlanCmd,
+	}, "", nil
+}
+
+func (p *DefaultProjectCommandRunner) doStateRm(ctx command.ProjectContext) (out *models.StateRmSuccess, failure string, err error) {
+	// Clone is idempotent so okay to run even if the repo was already cloned.
+	repoDir, cloneErr := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
+	if cloneErr != nil {
+		return nil, "", cloneErr
+	}
+	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
+	if _, err = os.Stat(projAbsPath); os.IsNotExist(err) {
+		return nil, "", DirNotExistErr{RepoRelDir: ctx.RepoRelDir}
+	}
+
+	// Acquire Atlantis lock for this repo/dir/workspace.
+	lockAttempt, err := p.Locker.TryLock(ctx.Log, ctx.Pull, ctx.User, ctx.Workspace, models.NewProject(ctx.Pull.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), ctx.RepoLocksMode != valid.RepoLocksDisabledMode)
+	if err != nil {
+		return nil, "", fmt.Errorf("acquiring lock: %w", err)
+	}
+	if !lockAttempt.LockAcquired {
+		return nil, lockAttempt.LockFailureReason, nil
+	}
+	ctx.Log.Debug("acquired lock for project")
+
+	// Acquire internal lock for the directory we're going to operate in.
+	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.State)
+	if err != nil {
+		return nil, "", err
+	}
+	defer unlockFn()
+
+	outputs, err := p.runSteps(ctx.Steps, ctx, projAbsPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s\n%s", err, strings.Join(outputs, "\n"))
+	}
+
+	// after state rm, re-plan command is required without state rm args
+	rePlanCmd := strings.TrimSpace(strings.Split(ctx.RePlanCmd, "--")[0])
+	return &models.StateRmSuccess{
+		Output:    strings.Join(outputs, "\n"),
+		RePlanCmd: rePlanCmd,
+	}, "", nil
 }
 
 func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.ProjectContext, absPath string) ([]string, error) {
@@ -492,19 +846,25 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 			out, err = p.ApplyStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "version":
 			out, err = p.VersionStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
+		case "import":
+			out, err = p.ImportStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
+		case "state_rm":
+			out, err = p.StateRmStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "run":
-			out, err = p.RunStepRunner.Run(ctx, step.RunCommand, absPath, envs, true)
+			out, err = p.RunStepRunner.Run(ctx, step.RunShell, step.RunCommand, absPath, envs, true, step.Output, step.FilterRegexes)
 		case "env":
-			out, err = p.EnvStepRunner.Run(ctx, step.RunCommand, step.EnvVarValue, absPath, envs)
+			out, err = p.EnvStepRunner.Run(ctx, step.RunShell, step.RunCommand, step.EnvVarValue, absPath, envs)
 			envs[step.EnvVarName] = out
 			// We reset out to the empty string because we don't want it to
 			// be printed to the PR, it's solely to set the environment variable.
 			out = ""
 		case "multienv":
-			out, err = p.MultiEnvStepRunner.Run(ctx, step.RunCommand, absPath, envs)
+			out, err = p.MultiEnvStepRunner.Run(ctx, step.RunShell, step.RunCommand, absPath, envs, step.Output)
 		}
 
-		if out != "" {
+		// Keep all policy_check outputs for custom policy checks to maintain positional alignment with policy sets
+		// Empty outputs are still appended to prevent index mismatches
+		if out != "" || (step.StepName == "policy_check" && ctx.CustomPolicyCheck) {
 			outputs = append(outputs, out)
 		}
 		if err != nil {
@@ -512,4 +872,13 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 		}
 	}
 	return outputs, nil
+}
+
+// getMissingPolicySetNames returns the names of policy sets that don't have corresponding outputs
+func getMissingPolicySetNames(policySets []valid.PolicySet, receivedCount int) []string {
+	var missing []string
+	for i := receivedCount; i < len(policySets); i++ {
+		missing = append(missing, policySets[i].Name)
+	}
+	return missing
 }

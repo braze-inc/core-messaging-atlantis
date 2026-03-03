@@ -15,43 +15,60 @@ package server_test
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/gorilla/mux"
-	. "github.com/petergtz/pegomock"
+	. "github.com/petergtz/pegomock/v4"
+	"github.com/runatlantis/atlantis/cmd"
 	"github.com/runatlantis/atlantis/server"
-	"github.com/runatlantis/atlantis/server/controllers/templates"
-	tMocks "github.com/runatlantis/atlantis/server/controllers/templates/mocks"
-	"github.com/runatlantis/atlantis/server/core/locking/mocks"
+	"github.com/runatlantis/atlantis/server/controllers/web_templates"
+	tMocks "github.com/runatlantis/atlantis/server/controllers/web_templates/mocks"
+	"github.com/runatlantis/atlantis/server/core/locking"
+	lockMocks "github.com/runatlantis/atlantis/server/core/locking/mocks"
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/logging"
 	. "github.com/runatlantis/atlantis/testing"
+	"go.uber.org/mock/gomock"
 )
 
-func TestNewServer(t *testing.T) {
+const (
+	testAtlantisVersion = "1.0.0"
+	testAtlantisUrl     = "http://example.com"
+	testLockingDBType   = cmd.DefaultLockingDBType
+	testGitHubHostName  = cmd.DefaultGHHostname
+	testGitHubUser      = "user"
+)
+
+func TestNewServer_GitHubUser(t *testing.T) {
 	t.Log("Run through NewServer constructor")
-	tmpDir, err := os.MkdirTemp("", "")
-	Ok(t, err)
-	_, err = server.NewServer(server.UserConfig{
-		DataDir:     tmpDir,
-		AtlantisURL: "http://example.com",
-	}, server.Config{})
+	tmpDir := t.TempDir()
+	_, err := server.NewServer(
+		server.UserConfig{
+			DataDir:        tmpDir,
+			AtlantisURL:    testAtlantisUrl,
+			LockingDBType:  testLockingDBType,
+			GithubHostname: testGitHubHostName,
+			GithubUser:     testGitHubUser,
+		}, server.Config{
+			AtlantisVersion: testAtlantisVersion,
+		},
+	)
 	Ok(t, err)
 }
 
 // todo: test what happens if we set different flags. The generated config should be different.
 
 func TestNewServer_InvalidAtlantisURL(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "")
-	Ok(t, err)
-	_, err = server.NewServer(server.UserConfig{
+	tmpDir := t.TempDir()
+	_, err := server.NewServer(server.UserConfig{
 		DataDir:     tmpDir,
 		AtlantisURL: "example.com",
 	}, server.Config{
@@ -62,9 +79,9 @@ func TestNewServer_InvalidAtlantisURL(t *testing.T) {
 
 func TestIndex_LockErr(t *testing.T) {
 	t.Log("index should return a 503 if unable to list locks")
-	RegisterMockTestingT(t)
-	l := mocks.NewMockLocker()
-	When(l.List()).ThenReturn(nil, errors.New("err"))
+	ctrl := gomock.NewController(t)
+	l := lockMocks.NewMockLocker(ctrl)
+	l.EXPECT().List().Return(nil, errors.New("err"))
 	s := server.Server{
 		Locker: l,
 	}
@@ -76,9 +93,10 @@ func TestIndex_LockErr(t *testing.T) {
 
 func TestIndex_Success(t *testing.T) {
 	t.Log("Index should render the index template successfully.")
-	RegisterMockTestingT(t)
-	l := mocks.NewMockLocker()
-	al := mocks.NewMockApplyLocker()
+	RegisterMockTestingT(t) // needed for pegomock TemplateWriter mock
+	ctrl := gomock.NewController(t)
+	l := lockMocks.NewMockLocker(ctrl)
+	al := lockMocks.NewMockApplyLocker(ctrl)
 	// These are the locks that we expect to be rendered.
 	now := time.Now()
 	locks := map[string]models.ProjectLock{
@@ -92,7 +110,8 @@ func TestIndex_Success(t *testing.T) {
 			Time: now,
 		},
 	}
-	When(l.List()).ThenReturn(locks, nil)
+	l.EXPECT().List().Return(locks, nil)
+	al.EXPECT().CheckApplyLock().Return(locking.ApplyCommandLock{}, nil)
 	it := tMocks.NewMockTemplateWriter()
 	r := mux.NewRouter()
 	atlantisVersion := "0.3.1"
@@ -102,33 +121,35 @@ func TestIndex_Success(t *testing.T) {
 	u, err := url.Parse("https://example.com")
 	Ok(t, err)
 	s := server.Server{
-		Locker:          l,
-		ApplyLocker:     al,
-		IndexTemplate:   it,
-		Router:          r,
-		AtlantisVersion: atlantisVersion,
-		AtlantisURL:     u,
-		Logger:          logging.NewNoopLogger(t),
+		Locker:                  l,
+		ApplyLocker:             al,
+		IndexTemplate:           it,
+		Router:                  r,
+		AtlantisVersion:         atlantisVersion,
+		AtlantisURL:             u,
+		Logger:                  logging.NewNoopLogger(t),
+		ProjectCmdOutputHandler: &jobs.NoopProjectOutputHandler{},
 	}
 	req, _ := http.NewRequest("GET", "", bytes.NewBuffer(nil))
 	w := httptest.NewRecorder()
 	s.Index(w, req)
-	it.VerifyWasCalledOnce().Execute(w, templates.IndexData{
-		ApplyLock: templates.ApplyLockData{
+	it.VerifyWasCalledOnce().Execute(w, web_templates.IndexData{
+		ApplyLock: web_templates.ApplyLockData{
 			Locked:        false,
 			Time:          time.Time{},
-			TimeFormatted: "01-01-0001 00:00:00",
+			TimeFormatted: "0001-01-01 00:00:00",
 		},
-		Locks: []templates.LockIndexData{
+		Locks: []web_templates.LockIndexData{
 			{
 				LockPath:      "/lock?id=lkysow%252Fatlantis-example%252F.%252Fdefault",
 				RepoFullName:  "lkysow/atlantis-example",
 				PullNum:       9,
 				Time:          now,
-				TimeFormatted: now.Format("02-01-2006 15:04:05"),
+				TimeFormatted: now.Format("2006-01-02 15:04:05"),
 			},
 		},
-		AtlantisVersion: atlantisVersion,
+		PullToJobMapping: []jobs.PullInfoWithJobIDs{},
+		AtlantisVersion:  atlantisVersion,
 	})
 	ResponseContains(t, w, http.StatusOK, "")
 }
@@ -138,9 +159,12 @@ func TestHealthz(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/healthz", bytes.NewBuffer(nil))
 	w := httptest.NewRecorder()
 	s.Healthz(w, req)
-	Equals(t, http.StatusOK, w.Result().StatusCode)
-	body, _ := io.ReadAll(w.Result().Body)
-	Equals(t, "application/json", w.Result().Header["Content-Type"][0])
+
+	resp := w.Result()
+	defer resp.Body.Close()
+	Equals(t, http.StatusOK, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	Equals(t, "application/json", resp.Header["Content-Type"][0])
 	Equals(t,
 		`{
   "status": "ok"
@@ -161,9 +185,33 @@ var s = &server.Server{}
 
 func BenchmarkHealthz(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		s.Healthz(w, nil)
 	}
+}
+
+func TestGetCertificate(t *testing.T) {
+	s := server.Server{}
+	clientHelloInfo := &tls.ClientHelloInfo{}
+
+	// Initial certificate load
+	s.SSLCertFile = "../testdata/cert.pem"
+	s.SSLKeyFile = "../testdata/key.pem"
+	cert, err := s.GetSSLCertificate(clientHelloInfo)
+	Ok(t, err)
+
+	// Certificate reload
+	s.SSLCertFile = "../testdata/cert2.pem"
+	s.SSLKeyFile = "../testdata/key2.pem"
+	s.CertLastRefreshTime = s.CertLastRefreshTime.Add(-1 * time.Second)
+	s.KeyLastRefreshTime = s.KeyLastRefreshTime.Add(-1 * time.Second)
+	newCert, err := s.GetSSLCertificate(clientHelloInfo)
+
+	Ok(t, err)
+	Assert(
+		t,
+		!bytes.Equal(bytes.Join(cert.Certificate, nil), bytes.Join(newCert.Certificate, nil)),
+		"Certificate expected to rotate")
 }
 
 func TestParseAtlantisURL(t *testing.T) {

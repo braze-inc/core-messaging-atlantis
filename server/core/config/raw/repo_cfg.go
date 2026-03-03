@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw
 
 import (
@@ -7,20 +10,11 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 )
 
-// DefaultAutomerge is the default setting for automerge.
-const DefaultAutomerge = false
+// DefaultEmojiReaction is the default emoji reaction for repos
+const DefaultEmojiReaction = ""
 
-// DefaultParallelApply is the default setting for parallel apply
-const DefaultParallelApply = false
-
-// DefaultParallelPlan is the default setting for parallel plan
-const DefaultParallelPlan = false
-
-// DefaultParallelPolicyCheck is the default setting for parallel plan
-const DefaultParallelPolicyCheck = false
-
-// DefaultDeleteSourceBranchOnMerge being false is the default setting whether or not to remove a source branch on merge
-const DefaultDeleteSourceBranchOnMerge = false
+// DefaultAbortOnExecutionOrderFail being false is the default setting for abort on execution group failures
+const DefaultAbortOnExecutionOrderFail = false
 
 // RepoCfg is the raw schema for repo-level atlantis.yaml config.
 type RepoCfg struct {
@@ -28,15 +22,20 @@ type RepoCfg struct {
 	Projects                  []Project           `yaml:"projects,omitempty"`
 	Workflows                 map[string]Workflow `yaml:"workflows,omitempty"`
 	PolicySets                PolicySets          `yaml:"policies,omitempty"`
+	AutoDiscover              *AutoDiscover       `yaml:"autodiscover,omitempty"`
 	Automerge                 *bool               `yaml:"automerge,omitempty"`
 	ParallelApply             *bool               `yaml:"parallel_apply,omitempty"`
 	ParallelPlan              *bool               `yaml:"parallel_plan,omitempty"`
 	DeleteSourceBranchOnMerge *bool               `yaml:"delete_source_branch_on_merge,omitempty"`
+	EmojiReaction             *string             `yaml:"emoji_reaction,omitempty"`
 	AllowedRegexpPrefixes     []string            `yaml:"allowed_regexp_prefixes,omitempty"`
+	AbortOnExecutionOrderFail *bool               `yaml:"abort_on_execution_order_fail,omitempty"`
+	RepoLocks                 *RepoLocks          `yaml:"repo_locks,omitempty"`
+	SilencePRComments         []string            `yaml:"silence_pr_comments,omitempty"`
 }
 
 func (r RepoCfg) Validate() error {
-	equals2 := func(value interface{}) error {
+	equals2 := func(value any) error {
 		asIntPtr := value.(*int)
 		if asIntPtr == nil {
 			return errors.New("is required. If you've just upgraded Atlantis you need to rewrite your atlantis.yaml for version 3. See www.runatlantis.io/docs/upgrading-atlantis-yaml.html")
@@ -64,30 +63,43 @@ func (r RepoCfg) ToValid() valid.RepoCfg {
 		validProjects = append(validProjects, p.ToValid())
 	}
 
-	automerge := DefaultAutomerge
-	if r.Automerge != nil {
-		automerge = *r.Automerge
+	automerge := r.Automerge
+	parallelApply := r.ParallelApply
+	parallelPlan := r.ParallelPlan
+
+	emojiReaction := DefaultEmojiReaction
+	if r.EmojiReaction != nil {
+		emojiReaction = *r.EmojiReaction
 	}
 
-	parallelApply := DefaultParallelApply
-	if r.ParallelApply != nil {
-		parallelApply = *r.ParallelApply
+	abortOnExecutionOrderFail := DefaultAbortOnExecutionOrderFail
+	if r.AbortOnExecutionOrderFail != nil {
+		abortOnExecutionOrderFail = *r.AbortOnExecutionOrderFail
 	}
 
-	parallelPlan := DefaultParallelPlan
-	if r.ParallelPlan != nil {
-		parallelPlan = *r.ParallelPlan
+	var autoDiscover *valid.AutoDiscover
+	if r.AutoDiscover != nil {
+		autoDiscover = r.AutoDiscover.ToValid()
 	}
 
+	var repoLocks *valid.RepoLocks
+	if r.RepoLocks != nil {
+		repoLocks = r.RepoLocks.ToValid()
+	}
 	return valid.RepoCfg{
 		Version:                   *r.Version,
 		Projects:                  validProjects,
 		Workflows:                 validWorkflows,
+		AutoDiscover:              autoDiscover,
 		Automerge:                 automerge,
 		ParallelApply:             parallelApply,
 		ParallelPlan:              parallelPlan,
 		ParallelPolicyCheck:       parallelPlan,
 		DeleteSourceBranchOnMerge: r.DeleteSourceBranchOnMerge,
 		AllowedRegexpPrefixes:     r.AllowedRegexpPrefixes,
+		EmojiReaction:             emojiReaction,
+		AbortOnExecutionOrderFail: abortOnExecutionOrderFail,
+		RepoLocks:                 repoLocks,
+		SilencePRComments:         r.SilencePRComments,
 	}
 }

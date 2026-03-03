@@ -1,3 +1,92 @@
+**NOTE:** We do not plan to update this page anymore. Please see [the releases page for the updated changelog](https://github.com/runatlantis/atlantis/releases).
+
+---
+
+# v0.23.3
+
+Bugfixes and new Features
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.23.3
+
+# v0.23.2
+
+Bugfixes and new Features
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.23.2
+
+# v0.23.1
+
+Bugfixes and new Features
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.23.1
+
+# v0.23.0
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.23.0
+
+# v0.22.3
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.22.3
+
+# v0.22.2
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.22.2
+
+# v0.22.1
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.22.1
+
+# v0.22.0
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.22.0
+
+# v0.21.0
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.21.0
+
+## Breaking changes
+* Terraform version 1.x have been removed to deprecate beta versions of terraform and reduce the docker image size. Each version of terraform is about 80 MB. ([#2619](https://github.com/runatlantis/atlantis/pull/2619))
+
+# v0.20.1
+
+Bugfixes and new Features
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.20.1
+
+# v0.20.0
+
+Broken build due to github action issues
+
+## What's Changed
+
+https://github.com/runatlantis/atlantis/releases/tag/v0.20.0
+
 # v0.19.8
 
 Bugfixes and new Features
@@ -111,7 +200,7 @@ Maintenance release for security patches with atlantis-base image
 * docker: bump git-lfs and gosu dependencies by @hi-artem in https://github.com/runatlantis/atlantis/pull/2096
 * fix(docker): fix base image for multi-platform build by @Tenzer in https://github.com/runatlantis/atlantis/pull/2099
 * fix(docker): fix installation of git-lfs in armv7 image by @Tenzer in https://github.com/runatlantis/atlantis/pull/2100
-* fix(docker): download Terraform and conftest versions maching image architecture by @Tenzer in https://github.com/runatlantis/atlantis/pull/2101
+* fix(docker): download Terraform and conftest versions matching image architecture by @Tenzer in https://github.com/runatlantis/atlantis/pull/2101
 
 # v0.18.3
 
@@ -148,7 +237,7 @@ Maintenance release for security patches with atlantis-base image
 * build(deps): bump github.com/hashicorp/go-version from 1.3.0 to 1.4.0 by @dependabot in https://github.com/runatlantis/atlantis/pull/1987
 * build(deps): bump go.uber.org/zap from 1.19.1 to 1.20.0 by @dependabot in https://github.com/runatlantis/atlantis/pull/1988
 * docs: document `undiverged` apply requirement in more places by @fishpen0 in https://github.com/runatlantis/atlantis/pull/1992
-* fix: fix autoplan when .terraform.lock.hcl is modifed by @gezb in https://github.com/runatlantis/atlantis/pull/1991
+* fix: fix autoplan when .terraform.lock.hcl is modified by @gezb in https://github.com/runatlantis/atlantis/pull/1991
 * feat: add XTerm JS to the server static files by @Ka1wa in https://github.com/runatlantis/atlantis/pull/1985
 * feat: post workflow hooks by @tim775 in https://github.com/runatlantis/atlantis/pull/1990
 * docs: add colon to policy checking yaml by @williamlord-wise in https://github.com/runatlantis/atlantis/pull/1996
@@ -1707,7 +1796,7 @@ These are the changes in detail:
     ```
 
     The `w` group permission was added so that in OpenShift, the random uid can write
-    their own login entry (https://github.com/runatlantis/atlantis/blob/master/docker-entrypoint.sh#L28)
+    their own login entry (https://github.com/runatlantis/atlantis/blob/main/docker-entrypoint.sh#L28)
     which is required because `terraform` expects the running user to have an entry
     in `/etc/passwd`.
 
@@ -2450,7 +2539,7 @@ None
 assume role session with the GitHub username of the user running the Atlantis command
 use the `atlantis_user` terraform variable alongside Terraform's
 [built-in support](https://www.terraform.io/docs/providers/aws/#assume-role) for assume role
-(see https://github.com/runatlantis/atlantis/blob/master/README.md#assume-role-session-names)
+(see https://github.com/runatlantis/atlantis/blob/main/README.md#assume-role-session-names)
 * Atlantis has a docker image now ([#123](https://github.com/hootsuite/atlantis/pull/123)). Here is how you can try it out:
 
 ```bash

@@ -1,13 +1,17 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
 	validation "github.com/go-ozzo/ozzo-validation"
-	"github.com/pkg/errors"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/utils"
 )
 
 // GlobalCfg is the raw schema for server-side repo config.
@@ -16,13 +20,17 @@ type GlobalCfg struct {
 	Workflows  map[string]Workflow `yaml:"workflows" json:"workflows"`
 	PolicySets PolicySets          `yaml:"policies" json:"policies"`
 	Metrics    Metrics             `yaml:"metrics" json:"metrics"`
+	TeamAuthz  TeamAuthz           `yaml:"team_authz" json:"team_authz"`
 }
 
 // Repo is the raw schema for repos in the server-side repo config.
 type Repo struct {
 	ID                        string         `yaml:"id" json:"id"`
 	Branch                    string         `yaml:"branch" json:"branch"`
+	RepoConfigFile            string         `yaml:"repo_config_file" json:"repo_config_file"`
+	PlanRequirements          []string       `yaml:"plan_requirements" json:"plan_requirements"`
 	ApplyRequirements         []string       `yaml:"apply_requirements" json:"apply_requirements"`
+	ImportRequirements        []string       `yaml:"import_requirements" json:"import_requirements"`
 	PreWorkflowHooks          []WorkflowHook `yaml:"pre_workflow_hooks" json:"pre_workflow_hooks"`
 	Workflow                  *string        `yaml:"workflow,omitempty" json:"workflow,omitempty"`
 	PostWorkflowHooks         []WorkflowHook `yaml:"post_workflow_hooks" json:"post_workflow_hooks"`
@@ -30,6 +38,12 @@ type Repo struct {
 	AllowedOverrides          []string       `yaml:"allowed_overrides" json:"allowed_overrides"`
 	AllowCustomWorkflows      *bool          `yaml:"allow_custom_workflows,omitempty" json:"allow_custom_workflows,omitempty"`
 	DeleteSourceBranchOnMerge *bool          `yaml:"delete_source_branch_on_merge,omitempty" json:"delete_source_branch_on_merge,omitempty"`
+	RepoLocking               *bool          `yaml:"repo_locking,omitempty" json:"repo_locking,omitempty"`
+	RepoLocks                 *RepoLocks     `yaml:"repo_locks,omitempty" json:"repo_locks,omitempty"`
+	PolicyCheck               *bool          `yaml:"policy_check,omitempty" json:"policy_check,omitempty"`
+	CustomPolicyCheck         *bool          `yaml:"custom_policy_check,omitempty" json:"custom_policy_check,omitempty"`
+	AutoDiscover              *AutoDiscover  `yaml:"autodiscover,omitempty" json:"autodiscover,omitempty"`
+	SilencePRComments         []string       `yaml:"silence_pr_comments,omitempty" json:"silence_pr_comments,omitempty"`
 }
 
 func (g GlobalCfg) Validate() error {
@@ -86,6 +100,24 @@ func (g GlobalCfg) Validate() error {
 			}
 		}
 	}
+
+	// Validate supported SilencePRComments values.
+	for _, repo := range g.Repos {
+		if repo.SilencePRComments == nil {
+			continue
+		}
+		for _, silenceStage := range repo.SilencePRComments {
+			if !utils.SlicesContains(valid.AllowedSilencePRComments, silenceStage) {
+				return fmt.Errorf(
+					"server-side repo config '%s' key value of '%s' is not supported, supported values are [%s]",
+					valid.SilencePRCommentsKey,
+					silenceStage,
+					strings.Join(valid.AllowedSilencePRComments, ", "),
+				)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -93,17 +125,17 @@ func (g GlobalCfg) ToValid(defaultCfg valid.GlobalCfg) valid.GlobalCfg {
 	workflows := make(map[string]valid.Workflow)
 
 	// assumes: globalcfg is always initialized with one repo .*
+	globalPlanReqs := defaultCfg.Repos[0].PlanRequirements
 	applyReqs := defaultCfg.Repos[0].ApplyRequirements
-
 	var globalApplyReqs []string
-
 	for _, req := range applyReqs {
-		for _, nonOverrideableReq := range valid.NonOverrideableApplyReqs {
-			if req == nonOverrideableReq {
+		for _, nonOverridableReq := range valid.NonOverridableApplyReqs {
+			if req == nonOverridableReq {
 				globalApplyReqs = append(globalApplyReqs, req)
 			}
 		}
 	}
+	globalImportReqs := defaultCfg.Repos[0].ImportRequirements
 
 	for k, v := range g.Workflows {
 		validatedWorkflow := v.ToValid(k)
@@ -124,7 +156,7 @@ func (g GlobalCfg) ToValid(defaultCfg valid.GlobalCfg) valid.GlobalCfg {
 
 	var repos []valid.Repo
 	for _, r := range g.Repos {
-		repos = append(repos, r.ToValid(workflows, globalApplyReqs))
+		repos = append(repos, r.ToValid(workflows, globalPlanReqs, globalApplyReqs, globalImportReqs))
 	}
 	repos = append(defaultCfg.Repos, repos...)
 
@@ -133,6 +165,7 @@ func (g GlobalCfg) ToValid(defaultCfg valid.GlobalCfg) valid.GlobalCfg {
 		Workflows:  workflows,
 		PolicySets: g.PolicySets.ToValid(),
 		Metrics:    g.Metrics.ToValid(),
+		TeamAuthz:  g.TeamAuthz.ToValid(),
 	}
 }
 
@@ -148,56 +181,101 @@ func (r Repo) HasRegexBranch() bool {
 }
 
 func (r Repo) Validate() error {
-	idValid := func(value interface{}) error {
+	idValid := func(value any) error {
 		id := value.(string)
 		if !r.HasRegexID() {
 			return nil
 		}
 		_, err := regexp.Compile(id[1 : len(id)-1])
-		return errors.Wrapf(err, "parsing: %s", id)
+		if err != nil {
+			return fmt.Errorf("parsing: %s: %w", id, err)
+		}
+		return nil
 	}
 
-	branchValid := func(value interface{}) error {
+	branchValid := func(value any) error {
 		branch := value.(string)
-		if !r.HasRegexBranch() {
+		if branch == "" {
 			return nil
 		}
-		_, err := regexp.Compile(branch[1 : len(branch)-1])
-		return errors.Wrapf(err, "parsing: %s", branch)
+		if !strings.HasPrefix(branch, "/") || !strings.HasSuffix(branch, "/") {
+			return errors.New("regex must begin and end with a slash '/'")
+		}
+		withoutSlashes := branch[1 : len(branch)-1]
+		_, err := regexp.Compile(withoutSlashes)
+		if err != nil {
+			return fmt.Errorf("parsing: %s: %w", branch, err)
+		}
+		return nil
 	}
 
-	overridesValid := func(value interface{}) error {
+	repoConfigFileValid := func(value any) error {
+		repoConfigFile := value.(string)
+		if repoConfigFile == "" {
+			return nil
+		}
+		if strings.HasPrefix(repoConfigFile, "/") {
+			return errors.New("must not starts with a slash '/'")
+		}
+		if strings.Contains(repoConfigFile, "../") || strings.Contains(repoConfigFile, "..\\") {
+			return errors.New("must not contains parent directory path like '../'")
+		}
+		return nil
+	}
+
+	overridesValid := func(value any) error {
 		overrides := value.([]string)
 		for _, o := range overrides {
-			if o != valid.ApplyRequirementsKey && o != valid.WorkflowKey && o != valid.DeleteSourceBranchOnMergeKey {
-				return fmt.Errorf("%q is not a valid override, only %q, %q and %q are supported", o, valid.ApplyRequirementsKey, valid.WorkflowKey, valid.DeleteSourceBranchOnMergeKey)
+			if o != valid.PlanRequirementsKey && o != valid.ApplyRequirementsKey && o != valid.ImportRequirementsKey && o != valid.WorkflowKey && o != valid.DeleteSourceBranchOnMergeKey && o != valid.RepoLockingKey && o != valid.RepoLocksKey && o != valid.PolicyCheckKey && o != valid.CustomPolicyCheckKey && o != valid.SilencePRCommentsKey {
+				return fmt.Errorf("%q is not a valid override, only %q, %q, %q, %q, %q, %q, %q, %q, %q, and %q are supported", o, valid.PlanRequirementsKey, valid.ApplyRequirementsKey, valid.ImportRequirementsKey, valid.WorkflowKey, valid.DeleteSourceBranchOnMergeKey, valid.RepoLockingKey, valid.RepoLocksKey, valid.PolicyCheckKey, valid.CustomPolicyCheckKey, valid.SilencePRCommentsKey)
 			}
 		}
 		return nil
 	}
 
-	workflowExists := func(value interface{}) error {
+	workflowExists := func(value any) error {
 		// We validate workflows in ParserValidator.validateRepoWorkflows
 		// because we need the list of workflows to validate.
 		return nil
 	}
 
-	deleteSourceBranchOnMergeValid := func(value interface{}) error {
+	deleteSourceBranchOnMergeValid := func(value any) error {
 		//TOBE IMPLEMENTED
+		return nil
+	}
+
+	autoDiscoverValid := func(value any) error {
+		autoDiscover := value.(*AutoDiscover)
+		if autoDiscover != nil {
+			return autoDiscover.Validate()
+		}
+		return nil
+	}
+
+	repoLocksValid := func(value any) error {
+		repoLocks := value.(*RepoLocks)
+		if repoLocks != nil {
+			return repoLocks.Validate()
+		}
 		return nil
 	}
 
 	return validation.ValidateStruct(&r,
 		validation.Field(&r.ID, validation.Required, validation.By(idValid)),
 		validation.Field(&r.Branch, validation.By(branchValid)),
+		validation.Field(&r.RepoConfigFile, validation.By(repoConfigFileValid)),
 		validation.Field(&r.AllowedOverrides, validation.By(overridesValid)),
+		validation.Field(&r.PlanRequirements, validation.By(validPlanReq)),
 		validation.Field(&r.ApplyRequirements, validation.By(validApplyReq)),
+		validation.Field(&r.ImportRequirements, validation.By(validImportReq)),
 		validation.Field(&r.Workflow, validation.By(workflowExists)),
 		validation.Field(&r.DeleteSourceBranchOnMerge, validation.By(deleteSourceBranchOnMergeValid)),
+		validation.Field(&r.AutoDiscover, validation.By(autoDiscoverValid)),
+		validation.Field(&r.RepoLocks, validation.By(repoLocksValid)),
 	)
 }
 
-func (r Repo) ToValid(workflows map[string]valid.Workflow, globalApplyReqs []string) valid.Repo {
+func (r Repo) ToValid(workflows map[string]valid.Workflow, globalPlanReqs []string, globalApplyReqs []string, globalImportReqs []string) valid.Repo {
 	var id string
 	var idRegex *regexp.Regexp
 	if r.HasRegexID() {
@@ -237,26 +315,75 @@ func (r Repo) ToValid(workflows map[string]valid.Workflow, globalApplyReqs []str
 		}
 	}
 
+	var mergedPlanReqs []string
+	mergedPlanReqs = append(mergedPlanReqs, r.PlanRequirements...)
 	var mergedApplyReqs []string
-
 	mergedApplyReqs = append(mergedApplyReqs, r.ApplyRequirements...)
+	var mergedImportReqs []string
+	mergedImportReqs = append(mergedImportReqs, r.ImportRequirements...)
 
 	// only add global reqs if they don't exist already.
-OUTER:
+OuterGlobalPlanReqs:
+	for _, globalReq := range globalPlanReqs {
+		for _, currReq := range r.PlanRequirements {
+			if globalReq == currReq {
+				continue OuterGlobalPlanReqs
+			}
+		}
+
+		// dont add policy_check step if repo have it explicitly disabled
+		if globalReq == valid.PoliciesPassedCommandReq && r.PolicyCheck != nil && !*r.PolicyCheck {
+			continue
+		}
+		mergedPlanReqs = append(mergedPlanReqs, globalReq)
+	}
+OuterGlobalApplyReqs:
 	for _, globalReq := range globalApplyReqs {
 		for _, currReq := range r.ApplyRequirements {
 			if globalReq == currReq {
-				continue OUTER
+				continue OuterGlobalApplyReqs
 			}
 		}
+
+		// dont add policy_check step if repo have it explicitly disabled
+		if globalReq == valid.PoliciesPassedCommandReq && r.PolicyCheck != nil && !*r.PolicyCheck {
+			continue
+		}
 		mergedApplyReqs = append(mergedApplyReqs, globalReq)
+	}
+OuterGlobalImportReqs:
+	for _, globalReq := range globalImportReqs {
+		for _, currReq := range r.ImportRequirements {
+			if globalReq == currReq {
+				continue OuterGlobalImportReqs
+			}
+		}
+
+		// dont add policy_check step if repo have it explicitly disabled
+		if globalReq == valid.PoliciesPassedCommandReq && r.PolicyCheck != nil && !*r.PolicyCheck {
+			continue
+		}
+		mergedImportReqs = append(mergedImportReqs, globalReq)
+	}
+
+	var autoDiscover *valid.AutoDiscover
+	if r.AutoDiscover != nil {
+		autoDiscover = r.AutoDiscover.ToValid()
+	}
+
+	var repoLocks *valid.RepoLocks
+	if r.RepoLocks != nil {
+		repoLocks = r.RepoLocks.ToValid()
 	}
 
 	return valid.Repo{
 		ID:                        id,
 		IDRegex:                   idRegex,
 		BranchRegex:               branchRegex,
+		RepoConfigFile:            r.RepoConfigFile,
+		PlanRequirements:          mergedPlanReqs,
 		ApplyRequirements:         mergedApplyReqs,
+		ImportRequirements:        mergedImportReqs,
 		PreWorkflowHooks:          preWorkflowHooks,
 		Workflow:                  workflow,
 		PostWorkflowHooks:         postWorkflowHooks,
@@ -264,5 +391,11 @@ OUTER:
 		AllowedOverrides:          r.AllowedOverrides,
 		AllowCustomWorkflows:      r.AllowCustomWorkflows,
 		DeleteSourceBranchOnMerge: r.DeleteSourceBranchOnMerge,
+		RepoLocking:               r.RepoLocking,
+		RepoLocks:                 repoLocks,
+		PolicyCheck:               r.PolicyCheck,
+		CustomPolicyCheck:         r.CustomPolicyCheck,
+		AutoDiscover:              autoDiscover,
+		SilencePRComments:         r.SilencePRComments,
 	}
 }

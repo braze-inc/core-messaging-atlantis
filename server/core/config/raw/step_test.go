@@ -1,12 +1,16 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package raw_test
 
 import (
+	"regexp"
 	"testing"
 
 	"github.com/runatlantis/atlantis/server/core/config/raw"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	. "github.com/runatlantis/atlantis/testing"
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
 
 func TestStepConfig_YAMLMarshalling(t *testing.T) {
@@ -81,7 +85,7 @@ env:
   value: direct_value
   name: test`,
 			exp: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"value": "direct_value",
 						"name":  "test",
@@ -96,7 +100,7 @@ env:
   command: echo 123
   name: test`,
 			exp: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"command": "echo 123",
 						"name":    "test",
@@ -134,28 +138,28 @@ key: value`,
 			description: "empty",
 			input:       "",
 			exp: raw.Step{
-				Key:       nil,
-				Map:       nil,
-				StringVal: nil,
-				Env:       nil,
+				Key:        nil,
+				Map:        nil,
+				StringVal:  nil,
+				CommandMap: nil,
 			},
 		},
 
 		// Errors
 		{
-			description: "extra args style no slice strings",
+			description: "extra args style no map strings",
 			input: `
 key:
-  value:
-    another: map`,
-			expErr: "yaml: unmarshal errors:\n  line 3: cannot unmarshal !!map into string",
+ - value:
+     another: map`,
+			expErr: "yaml: unmarshal errors:\n  line 3: cannot unmarshal !!seq into map[string]interface {}",
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.description, func(t *testing.T) {
 			var got raw.Step
-			err := yaml.UnmarshalStrict([]byte(c.input), &got)
+			err := unmarshalString(c.input, &got)
 			if c.expErr != "" {
 				ErrEquals(t, c.expErr, err)
 				return
@@ -167,7 +171,7 @@ key:
 			Ok(t, err)
 
 			var got2 raw.Step
-			err = yaml.UnmarshalStrict([]byte(c.input), &got2)
+			err = unmarshalString(c.input, &got2)
 			Ok(t, err)
 			Equals(t, got2, got)
 		})
@@ -227,10 +231,51 @@ func TestStep_Validate(t *testing.T) {
 		{
 			description: "env",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"name":    "test",
 						"command": "echo 123",
+					},
+				},
+			},
+			expErr: "",
+		},
+		{
+			description: "env shell",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"env": {
+						"name":    "test",
+						"command": "echo 123",
+						"shell":   "bash",
+					},
+				},
+			},
+			expErr: "",
+		},
+		{
+			description: "env shellArgs string",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"env": {
+						"name":      "test",
+						"command":   "echo 123",
+						"shell":     "bash",
+						"shellArgs": "-c",
+					},
+				},
+			},
+			expErr: "",
+		},
+		{
+			description: "env shellArgs list of strings",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"env": {
+						"name":      "test",
+						"command":   "echo 123",
+						"shell":     "bash",
+						"shellArgs": []any{"-c", "--debug"},
 					},
 				},
 			},
@@ -283,7 +328,7 @@ func TestStep_Validate(t *testing.T) {
 		{
 			description: "multiple keys in env",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"key1": nil,
 					"key2": nil,
 				},
@@ -312,7 +357,7 @@ func TestStep_Validate(t *testing.T) {
 		{
 			description: "invalid key in env",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"invalid": nil,
 				},
 			},
@@ -353,7 +398,7 @@ func TestStep_Validate(t *testing.T) {
 		{
 			description: "env step with no name key set",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"value": "value",
 					},
@@ -364,19 +409,19 @@ func TestStep_Validate(t *testing.T) {
 		{
 			description: "env step with invalid key",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"abc":      "",
 						"invalid2": "",
 					},
 				},
 			},
-			expErr: "env steps only support keys \"name\", \"value\" and \"command\", found key \"abc\"",
+			expErr: "env steps only support keys \"name\", \"value\", \"command\", \"shell\" and \"shellArgs\", found key \"abc\"",
 		},
 		{
 			description: "env step with both command and value set",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"name":    "name",
 						"command": "command",
@@ -387,9 +432,61 @@ func TestStep_Validate(t *testing.T) {
 			expErr: "env steps only support one of the \"value\" or \"command\" keys, found both",
 		},
 		{
+			description: "env step with shell set but not command",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"env": {
+						"name":  "name",
+						"shell": "bash",
+					},
+				},
+			},
+			expErr: "workflow steps only support \"shell\" key in combination with \"command\" key",
+		},
+		{
+			description: "env step with shellArgs set but not shell",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"env": {
+						"name":      "name",
+						"shellArgs": "-c",
+					},
+				},
+			},
+			expErr: "workflow steps only support \"shellArgs\" key in combination with \"shell\" key",
+		},
+		{
+			description: "run step with shellArgs is not list of strings",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"run": {
+						"name":      "name",
+						"command":   "echo",
+						"shell":     "shell",
+						"shellArgs": []int{42, 42},
+					},
+				},
+			},
+			expErr: "\"run\" step \"shellArgs\" option must be a string or a list of strings, found [42 42]",
+		},
+		{
+			description: "run step with shellArgs contain not strings",
+			input: raw.Step{
+				CommandMap: EnvType{
+					"run": {
+						"name":      "name",
+						"command":   "echo",
+						"shell":     "shell",
+						"shellArgs": []any{"-c", 42},
+					},
+				},
+			},
+			expErr: "\"run\" step \"shellArgs\" option must contain only strings, found 42",
+		},
+		{
 			// For atlantis.yaml v2, this wouldn't parse, but now there should
 			// be no error.
-			description: "unparseable shell command",
+			description: "unparsable shell command",
 			input: raw.Step{
 				StringVal: map[string]string{
 					"run": "my 'c",
@@ -410,6 +507,9 @@ func TestStep_Validate(t *testing.T) {
 }
 
 func TestStep_ToValid(t *testing.T) {
+	testRegexDotStar := regexp.MustCompile(".*")
+	testRegexSecret := regexp.MustCompile("((?i)secret:\\s\")[^\"]*")
+
 	cases := []struct {
 		description string
 		input       raw.Step
@@ -454,7 +554,7 @@ func TestStep_ToValid(t *testing.T) {
 		{
 			description: "env step",
 			input: raw.Step{
-				Env: EnvType{
+				CommandMap: EnvType{
 					"env": {
 						"name":    "test",
 						"command": "echo 123",
@@ -465,6 +565,15 @@ func TestStep_ToValid(t *testing.T) {
 				StepName:   "env",
 				RunCommand: "echo 123",
 				EnvVarName: "test",
+			},
+		},
+		{
+			description: "import step",
+			input: raw.Step{
+				Key: String("import"),
+			},
+			exp: valid.Step{
+				StepName: "import",
 			},
 		},
 		{
@@ -524,6 +633,20 @@ func TestStep_ToValid(t *testing.T) {
 			},
 		},
 		{
+			description: "import extra_args",
+			input: raw.Step{
+				Map: MapType{
+					"import": {
+						"extra_args": []string{"arg1", "arg2"},
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:  "import",
+				ExtraArgs: []string{"arg1", "arg2"},
+			},
+		},
+		{
 			description: "run step",
 			input: raw.Step{
 				StringVal: map[string]string{
@@ -535,6 +658,180 @@ func TestStep_ToValid(t *testing.T) {
 				RunCommand: "my 'run command'",
 			},
 		},
+		{
+			description: "run step with single output",
+			input: raw.Step{
+				CommandMap: RunType{
+					"run": {
+						"command": "my 'run command'",
+						"output":  "hide",
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "run",
+				RunCommand: "my 'run command'",
+				Output: []valid.PostProcessRunOutputOption{
+					"hide",
+				},
+			},
+		},
+		{
+			description: "run step with duplicated values",
+			input: raw.Step{
+				CommandMap: RunType{
+					"run": {
+						"command": "my 'run command'",
+						"output": []string{
+							"hide",
+							"hide",
+						},
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "run",
+				RunCommand: "my 'run command'",
+				Output: []valid.PostProcessRunOutputOption{
+					"hide",
+				},
+			},
+		},
+		{
+			description: "run step with multiple string outputs",
+			input: raw.Step{
+				CommandMap: RunType{
+					"run": {
+						"command": "my 'run command'",
+						"output": []string{
+							"show",
+							"strip_refreshing",
+						},
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "run",
+				RunCommand: "my 'run command'",
+				Output: []valid.PostProcessRunOutputOption{
+					"show",
+					"strip_refreshing",
+				},
+			},
+		},
+		{
+			description: "run step with single regex filter",
+			input: raw.Step{
+				CommandMap: RunType{
+					"run": {
+						"command": "my 'run command'",
+						"output": []any{
+							map[string]any{
+								"filter_regex": ".*",
+							},
+						},
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "run",
+				RunCommand: "my 'run command'",
+				Output: []valid.PostProcessRunOutputOption{
+					"filter_regex",
+				},
+				FilterRegexes: []*regexp.Regexp{
+					testRegexDotStar,
+				},
+			},
+		},
+		{
+			description: "run step with multiple mixed outputs and single regex",
+			input: raw.Step{
+				CommandMap: RunType{
+					"run": {
+						"command": "my 'run command'",
+						"output": []any{
+							"strip_refreshing",
+							map[string]any{
+								"filter_regex": ".*",
+							},
+						},
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "run",
+				RunCommand: "my 'run command'",
+				Output: []valid.PostProcessRunOutputOption{
+					"strip_refreshing",
+					"filter_regex",
+				},
+				FilterRegexes: []*regexp.Regexp{
+					testRegexDotStar,
+				},
+			},
+		},
+		{
+			description: "run step with multiple mixed outputs and multiple regexes",
+			input: raw.Step{
+				CommandMap: RunType{
+					"run": {
+						"command": "my 'run command'",
+						"output": []any{
+							"strip_refreshing",
+							map[string]any{
+								"filter_regex": ".*",
+							},
+							map[string]any{
+								"filter_regex": "((?i)secret:\\s\")[^\"]*",
+							},
+						},
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "run",
+				RunCommand: "my 'run command'",
+				Output: []valid.PostProcessRunOutputOption{
+					"strip_refreshing",
+					"filter_regex",
+				},
+				FilterRegexes: []*regexp.Regexp{
+					testRegexDotStar,
+					testRegexSecret,
+				},
+			},
+		},
+		{
+			description: "multienv step",
+			input: raw.Step{
+				StringVal: map[string]string{
+					"multienv": "envs.sh",
+				},
+			},
+			exp: valid.Step{
+				StepName:   "multienv",
+				RunCommand: "envs.sh",
+			},
+		},
+		{
+			description: "multienv step with single output",
+			input: raw.Step{
+				CommandMap: MultiEnvType{
+					"multienv": {
+						"command": "envs.sh",
+						"output":  "hide",
+					},
+				},
+			},
+			exp: valid.Step{
+				StepName:   "multienv",
+				RunCommand: "envs.sh",
+				Output: []valid.PostProcessRunOutputOption{
+					"hide",
+				},
+			},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.description, func(t *testing.T) {
@@ -544,4 +841,6 @@ func TestStep_ToValid(t *testing.T) {
 }
 
 type MapType map[string]map[string][]string
-type EnvType map[string]map[string]string
+type EnvType map[string]map[string]any
+type RunType map[string]map[string]any
+type MultiEnvType map[string]map[string]any

@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package controllers
 
 import (
@@ -5,10 +8,10 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/runatlantis/atlantis/server/controllers/templates"
-	"github.com/runatlantis/atlantis/server/core/db"
+	"github.com/runatlantis/atlantis/server/controllers/web_templates"
 
 	"github.com/gorilla/mux"
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -18,22 +21,22 @@ import (
 
 // LocksController handles all requests relating to Atlantis locks.
 type LocksController struct {
-	AtlantisVersion    string
-	AtlantisURL        *url.URL
-	Locker             locking.Locker
-	Logger             logging.SimpleLogging
-	ApplyLocker        locking.ApplyLocker
-	VCSClient          vcs.Client
-	LockDetailTemplate templates.TemplateWriter
-	WorkingDir         events.WorkingDir
-	WorkingDirLocker   events.WorkingDirLocker
-	DB                 *db.BoltDB
-	DeleteLockCommand  events.DeleteLockCommand
+	AtlantisVersion    string                       `validate:"required"`
+	AtlantisURL        *url.URL                     `validate:"required"`
+	Locker             locking.Locker               `validate:"required"`
+	Logger             logging.SimpleLogging        `validate:"required"`
+	ApplyLocker        locking.ApplyLocker          `validate:"required"`
+	VCSClient          vcs.Client                   `validate:"required"`
+	LockDetailTemplate web_templates.TemplateWriter `validate:"required"`
+	WorkingDir         events.WorkingDir            `validate:"required"`
+	WorkingDirLocker   events.WorkingDirLocker      `validate:"required"`
+	Database           db.Database                  `validate:"required"`
+	DeleteLockCommand  events.DeleteLockCommand     `validate:"required"`
 }
 
 // LockApply handles creating a global apply lock.
 // If Lock already exists it will be a no-op
-func (l *LocksController) LockApply(w http.ResponseWriter, r *http.Request) {
+func (l *LocksController) LockApply(w http.ResponseWriter, _ *http.Request) {
 	lock, err := l.ApplyLocker.LockApply()
 	if err != nil {
 		l.respond(w, logging.Error, http.StatusInternalServerError, "creating apply lock failed with: %s", err)
@@ -45,7 +48,7 @@ func (l *LocksController) LockApply(w http.ResponseWriter, r *http.Request) {
 
 // UnlockApply handles releasing a global apply lock.
 // If Lock doesn't exists it will be a no-op
-func (l *LocksController) UnlockApply(w http.ResponseWriter, r *http.Request) {
+func (l *LocksController) UnlockApply(w http.ResponseWriter, _ *http.Request) {
 	err := l.ApplyLocker.UnlockApply()
 	if err != nil {
 		l.respond(w, logging.Error, http.StatusInternalServerError, "deleting apply lock failed with: %s", err)
@@ -74,12 +77,12 @@ func (l *LocksController) GetLock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if lock == nil {
-		l.respond(w, logging.Info, http.StatusNotFound, "No lock found at id %q", idUnencoded)
+		l.respond(w, logging.Info, http.StatusNotFound, "No lock found at id '%s'", idUnencoded)
 		return
 	}
 
 	owner, repo := models.SplitRepoFullName(lock.Project.RepoFullName)
-	viewData := templates.LockDetailData{
+	viewData := web_templates.LockDetailData{
 		LockKeyEncoded:  id,
 		LockKey:         idUnencoded,
 		PullRequestLink: lock.Pull.URL,
@@ -108,18 +111,18 @@ func (l *LocksController) DeleteLock(w http.ResponseWriter, r *http.Request) {
 
 	idUnencoded, err := url.PathUnescape(id)
 	if err != nil {
-		l.respond(w, logging.Warn, http.StatusBadRequest, "Invalid lock id %q. Failed with error: %s", id, err)
+		l.respond(w, logging.Warn, http.StatusBadRequest, "Invalid lock id '%s'. Failed with error: '%s'", id, err)
 		return
 	}
 
-	lock, err := l.DeleteLockCommand.DeleteLock(idUnencoded)
+	lock, err := l.DeleteLockCommand.DeleteLock(l.Logger, idUnencoded)
 	if err != nil {
-		l.respond(w, logging.Error, http.StatusInternalServerError, "deleting lock failed with: %s", err)
+		l.respond(w, logging.Error, http.StatusInternalServerError, "deleting lock failed with: '%s'", err)
 		return
 	}
 
 	if lock == nil {
-		l.respond(w, logging.Info, http.StatusNotFound, "No lock found at id %q", idUnencoded)
+		l.respond(w, logging.Info, http.StatusNotFound, "No lock found at id '%s'", idUnencoded)
 		return
 	}
 
@@ -127,35 +130,25 @@ func (l *LocksController) DeleteLock(w http.ResponseWriter, r *http.Request) {
 	// installations of Atlantis will have locks in their DB that do not have
 	// this field on PullRequest. We skip commenting in this case.
 	if lock.Pull.BaseRepo != (models.Repo{}) {
-		unlock, err := l.WorkingDirLocker.TryLock(lock.Pull.BaseRepo.FullName, lock.Pull.Num, lock.Workspace, lock.Project.Path)
-		if err != nil {
-			l.Logger.Err("unable to obtain working dir lock when trying to delete old plans: %s", err)
-		} else {
-			defer unlock()
-			// nolint: vetshadow
-			if err := l.WorkingDir.DeleteForWorkspace(lock.Pull.BaseRepo, lock.Pull, lock.Workspace); err != nil {
-				l.Logger.Err("unable to delete workspace: %s", err)
-			}
-		}
-		if err := l.DB.UpdateProjectStatus(lock.Pull, lock.Workspace, lock.Project.Path, models.DiscardedPlanStatus); err != nil {
+		if err := l.Database.UpdateProjectStatus(lock.Pull, lock.Workspace, lock.Project.Path, models.DiscardedPlanStatus); err != nil {
 			l.Logger.Err("unable to update project status: %s", err)
 		}
 
 		// Once the lock has been deleted, comment back on the pull request.
 		comment := fmt.Sprintf("**Warning**: The plan for dir: `%s` workspace: `%s` was **discarded** via the Atlantis UI.\n\n"+
 			"To `apply` this plan you must run `plan` again.", lock.Project.Path, lock.Workspace)
-		if err = l.VCSClient.CreateComment(lock.Pull.BaseRepo, lock.Pull.Num, comment, ""); err != nil {
+		if err = l.VCSClient.CreateComment(l.Logger, lock.Pull.BaseRepo, lock.Pull.Num, comment, ""); err != nil {
 			l.Logger.Warn("failed commenting on pull request: %s", err)
 		}
 	} else {
 		l.Logger.Debug("skipping commenting on pull request and deleting workspace because BaseRepo field is empty")
 	}
-	l.respond(w, logging.Info, http.StatusOK, "Deleted lock id %q", id)
+	l.respond(w, logging.Info, http.StatusOK, "Deleted lock id '%s'", id)
 }
 
 // respond is a helper function to respond and log the response. lvl is the log
 // level to log at, code is the HTTP response code.
-func (l *LocksController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...interface{}) {
+func (l *LocksController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...any) {
 	response := fmt.Sprintf(format, args...)
 	l.Logger.Log(lvl, response)
 	w.WriteHeader(responseCode)

@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package command
 
 import (
@@ -6,16 +9,25 @@ import (
 
 // ProjectResult is the result of executing a plan/policy_check/apply for a specific project.
 type ProjectResult struct {
-	Command            Name
-	RepoRelDir         string
-	Workspace          string
+	ProjectCommandOutput
+	Command           Name
+	SubCommand        string
+	RepoRelDir        string
+	Workspace         string
+	ProjectName       string
+	SilencePRComments []string
+}
+
+// ProjectCommandOutput is the output of a plan/policy_check/apply for a specific project.
+type ProjectCommandOutput struct {
 	Error              error
 	Failure            string
 	PlanSuccess        *models.PlanSuccess
-	PolicyCheckSuccess *models.PolicyCheckSuccess
+	PolicyCheckResults *models.PolicyCheckResults
 	ApplySuccess       string
 	VersionSuccess     string
-	ProjectName        string
+	ImportSuccess      *models.ImportSuccess
+	StateRmSuccess     *models.StateRmSuccess
 }
 
 // CommitStatus returns the vcs commit status of this project result.
@@ -29,6 +41,22 @@ func (p ProjectResult) CommitStatus() models.CommitStatus {
 	return models.SuccessCommitStatus
 }
 
+// PolicyStatus returns the approval status of policy sets of this project result.
+func (p ProjectResult) PolicyStatus() []models.PolicySetStatus {
+	var policyStatuses []models.PolicySetStatus
+	if p.PolicyCheckResults != nil {
+		for _, policySet := range p.PolicyCheckResults.PolicySetResults {
+			policyStatus := models.PolicySetStatus{
+				PolicySetName: policySet.PolicySetName,
+				Passed:        policySet.Passed,
+				Approvals:     policySet.CurApprovals,
+			}
+			policyStatuses = append(policyStatuses, policyStatus)
+		}
+	}
+	return policyStatuses
+}
+
 // PlanStatus returns the plan status.
 func (p ProjectResult) PlanStatus() models.ProjectPlanStatus {
 	switch p.Command {
@@ -38,6 +66,8 @@ func (p ProjectResult) PlanStatus() models.ProjectPlanStatus {
 			return models.ErroredPlanStatus
 		} else if p.Failure != "" {
 			return models.ErroredPlanStatus
+		} else if p.PlanSuccess.NoChanges() {
+			return models.PlannedNoChangesPlanStatus
 		}
 		return models.PlannedPlanStatus
 	case PolicyCheck, ApprovePolicies:
@@ -61,5 +91,5 @@ func (p ProjectResult) PlanStatus() models.ProjectPlanStatus {
 
 // IsSuccessful returns true if this project result had no errors.
 func (p ProjectResult) IsSuccessful() bool {
-	return p.PlanSuccess != nil || p.PolicyCheckSuccess != nil || p.ApplySuccess != ""
+	return p.PlanSuccess != nil || (p.PolicyCheckResults != nil && p.Error == nil && p.Failure == "") || p.ApplySuccess != ""
 }

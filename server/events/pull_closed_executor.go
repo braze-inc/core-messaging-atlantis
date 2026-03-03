@@ -17,34 +17,33 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"text/template"
 
-	"github.com/runatlantis/atlantis/server/core/db"
-
 	"github.com/runatlantis/atlantis/server/logging"
 
-	"github.com/pkg/errors"
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 	"github.com/runatlantis/atlantis/server/jobs"
 )
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_resource_cleaner.go ResourceCleaner
+//go:generate pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_resource_cleaner.go ResourceCleaner
 
 type ResourceCleaner interface {
 	CleanUp(pullInfo jobs.PullInfo)
 }
 
-//go:generate pegomock generate -m --use-experimental-model-gen --package mocks -o mocks/mock_pull_cleaner.go PullCleaner
+//go:generate pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_pull_cleaner.go PullCleaner
 
 // PullCleaner cleans up pull requests after they're closed/merged.
 type PullCleaner interface {
 	// CleanUpPull deletes the workspaces used by the pull request on disk
 	// and deletes any locks associated with this pull request for all workspaces.
-	CleanUpPull(repo models.Repo, pull models.PullRequest) error
+	CleanUpPull(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) error
 }
 
 // PullClosedExecutor executes the tasks required to clean up a closed pull
@@ -53,10 +52,10 @@ type PullClosedExecutor struct {
 	Locker                   locking.Locker
 	VCSClient                vcs.Client
 	WorkingDir               WorkingDir
-	Logger                   logging.SimpleLogging
-	DB                       *db.BoltDB
+	Database                 db.Database
 	PullClosedTemplate       PullCleanupTemplate
 	LogStreamResourceCleaner ResourceCleaner
+	CancellationTracker      CancellationTracker
 }
 
 type templatedProject struct {
@@ -70,37 +69,39 @@ var pullClosedTemplate = template.Must(template.New("").Parse(
 		"- dir: `{{ .RepoRelDir }}` {{ .Workspaces }}{{ end }}"))
 
 type PullCleanupTemplate interface {
-	Execute(wr io.Writer, data interface{}) error
+	Execute(wr io.Writer, data any) error
 }
 
 type PullClosedEventTemplate struct{}
 
-func (t *PullClosedEventTemplate) Execute(wr io.Writer, data interface{}) error {
+func (t *PullClosedEventTemplate) Execute(wr io.Writer, data any) error {
 	return pullClosedTemplate.Execute(wr, data)
 }
 
 // CleanUpPull cleans up after a closed pull request.
-func (p *PullClosedExecutor) CleanUpPull(repo models.Repo, pull models.PullRequest) error {
-	pullStatus, err := p.DB.GetPullStatus(pull)
+func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) error {
+	pullStatus, err := p.Database.GetPullStatus(pull)
 	if err != nil {
 		// Log and continue to clean up other resources.
-		p.Logger.Err("retrieving pull status: %s", err)
+		logger.Err("retrieving pull status: %s", err)
 	}
 
 	if pullStatus != nil {
 		for _, project := range pullStatus.Projects {
 			jobContext := jobs.PullInfo{
-				PullNum:     pull.Num,
-				Repo:        pull.BaseRepo.Name,
-				Workspace:   project.Workspace,
-				ProjectName: project.ProjectName,
+				PullNum:      pull.Num,
+				Repo:         pull.BaseRepo.Name,
+				RepoFullName: pull.BaseRepo.FullName,
+				ProjectName:  project.ProjectName,
+				Path:         project.RepoRelDir,
+				Workspace:    project.Workspace,
 			}
 			p.LogStreamResourceCleaner.CleanUp(jobContext)
 		}
 	}
 
-	if err := p.WorkingDir.Delete(repo, pull); err != nil {
-		return errors.Wrap(err, "cleaning workspace")
+	if err := p.WorkingDir.Delete(logger, repo, pull); err != nil {
+		return fmt.Errorf("cleaning workspace: %w", err)
 	}
 
 	// Finally, delete locks. We do this last because when someone
@@ -108,12 +109,17 @@ func (p *PullClosedExecutor) CleanUpPull(repo models.Repo, pull models.PullReque
 	// so we might have plans laying around but no locks.
 	locks, err := p.Locker.UnlockByPull(repo.FullName, pull.Num)
 	if err != nil {
-		return errors.Wrap(err, "cleaning up locks")
+		return fmt.Errorf("cleaning up locks: %w", err)
 	}
 
 	// Delete pull from DB.
-	if err := p.DB.DeletePullStatus(pull); err != nil {
-		p.Logger.Err("deleting pull from db: %s", err)
+	if err := p.Database.DeletePullStatus(pull); err != nil {
+		logger.Err("deleting pull from db: %s", err)
+	}
+
+	// Clear any operations to avoid unbounded growth.
+	if p.CancellationTracker != nil {
+		p.CancellationTracker.Clear(pull)
 	}
 
 	// If there are no locks then there's no need to comment.
@@ -124,9 +130,9 @@ func (p *PullClosedExecutor) CleanUpPull(repo models.Repo, pull models.PullReque
 	templateData := p.buildTemplateData(locks)
 	var buf bytes.Buffer
 	if err = pullClosedTemplate.Execute(&buf, templateData); err != nil {
-		return errors.Wrap(err, "rendering template for comment")
+		return fmt.Errorf("rendering template for comment: %w", err)
 	}
-	return p.VCSClient.CreateComment(repo, pull.Num, buf.String(), "")
+	return p.VCSClient.CreateComment(logger, repo, pull.Num, buf.String(), "")
 }
 
 // buildTemplateData formats the lock data into a slice that can easily be
@@ -137,7 +143,10 @@ func (p *PullClosedExecutor) buildTemplateData(locks []models.ProjectLock) []tem
 	workspacesByPath := make(map[string][]string)
 	for _, l := range locks {
 		path := l.Project.Path
-		workspacesByPath[path] = append(workspacesByPath[path], l.Workspace)
+		// Check if workspace already exists to avoid duplicates
+		if !slices.Contains(workspacesByPath[path], l.Workspace) {
+			workspacesByPath[path] = append(workspacesByPath[path], l.Workspace)
+		}
 	}
 
 	// sort keys so we can write deterministic tests
@@ -150,6 +159,7 @@ func (p *PullClosedExecutor) buildTemplateData(locks []models.ProjectLock) []tem
 	var projects []templatedProject
 	for _, p := range sortedPaths {
 		workspace := workspacesByPath[p]
+		sort.Strings(workspace)
 		workspacesStr := fmt.Sprintf("`%s`", strings.Join(workspace, "`, `"))
 		if len(workspace) == 1 {
 			projects = append(projects, templatedProject{

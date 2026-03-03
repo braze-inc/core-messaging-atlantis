@@ -1,32 +1,70 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package events
 
 import (
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/metrics"
+	tally "github.com/uber-go/tally/v4"
 )
 
+type IntrumentedCommandRunner interface {
+	Plan(ctx command.ProjectContext) command.ProjectResult
+	PolicyCheck(ctx command.ProjectContext) command.ProjectResult
+	Apply(ctx command.ProjectContext) command.ProjectResult
+	ApprovePolicies(ctx command.ProjectContext) command.ProjectResult
+	Import(ctx command.ProjectContext) command.ProjectResult
+	StateRm(ctx command.ProjectContext) command.ProjectResult
+}
+
 type InstrumentedProjectCommandRunner struct {
-	ProjectCommandRunner
+	projectCommandRunner ProjectCommandRunner
+	scope                tally.Scope
 }
 
-func (p *InstrumentedProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectResult {
-	return RunAndEmitStats("plan", ctx, p.ProjectCommandRunner.Plan)
+func NewInstrumentedProjectCommandRunner(scope tally.Scope, projectCommandRunner ProjectCommandRunner) *InstrumentedProjectCommandRunner {
+	projectTags := command.ProjectScopeTags{}
+	scope = scope.SubScope("project").Tagged(projectTags.Loadtags())
+
+	for _, m := range []string{metrics.ExecutionSuccessMetric, metrics.ExecutionErrorMetric, metrics.ExecutionFailureMetric} {
+		metrics.InitCounter(scope, m)
+	}
+
+	return &InstrumentedProjectCommandRunner{
+		projectCommandRunner: projectCommandRunner,
+		scope:                scope,
+	}
 }
 
-func (p *InstrumentedProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) command.ProjectResult {
-	return RunAndEmitStats("policy check", ctx, p.ProjectCommandRunner.PolicyCheck)
+func (p *InstrumentedProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return RunAndEmitStats(ctx, p.projectCommandRunner.Plan, p.scope)
 }
 
-func (p *InstrumentedProjectCommandRunner) Apply(ctx command.ProjectContext) command.ProjectResult {
-	return RunAndEmitStats("apply", ctx, p.ProjectCommandRunner.Apply)
+func (p *InstrumentedProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return RunAndEmitStats(ctx, p.projectCommandRunner.PolicyCheck, p.scope)
 }
 
-func RunAndEmitStats(commandName string, ctx command.ProjectContext, execute func(ctx command.ProjectContext) command.ProjectResult) command.ProjectResult {
+func (p *InstrumentedProjectCommandRunner) Apply(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return RunAndEmitStats(ctx, p.projectCommandRunner.Apply, p.scope)
+}
 
+func (p *InstrumentedProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return RunAndEmitStats(ctx, p.projectCommandRunner.ApprovePolicies, p.scope)
+}
+
+func (p *InstrumentedProjectCommandRunner) Import(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return RunAndEmitStats(ctx, p.projectCommandRunner.Import, p.scope)
+}
+
+func (p *InstrumentedProjectCommandRunner) StateRm(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return RunAndEmitStats(ctx, p.projectCommandRunner.StateRm, p.scope)
+}
+
+func RunAndEmitStats(ctx command.ProjectContext, execute func(ctx command.ProjectContext) command.ProjectCommandOutput, scope tally.Scope) command.ProjectCommandOutput {
+	commandName := ctx.CommandName.String()
 	// ensures we are differentiating between project level command and overall command
-	ctx.SetScope("project")
-
-	scope := ctx.Scope
+	scope = ctx.SetProjectScopeTags(scope).SubScope(commandName)
 	logger := ctx.Log
 
 	executionTime := scope.Timer(metrics.ExecutionTimeMetric).Start()

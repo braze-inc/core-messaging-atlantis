@@ -1,37 +1,48 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package vcs
 
 import (
-	"github.com/pkg/errors"
+	"fmt"
+
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/logging"
 )
 
+//go:generate pegomock generate github.com/runatlantis/atlantis/server/events/vcs --package mocks -o mocks/mock_pull_req_status_fetcher.go PullReqStatusFetcher
+
 type PullReqStatusFetcher interface {
-	FetchPullStatus(repo models.Repo, pull models.PullRequest, vcsstatusname string) (models.PullReqStatus, error)
+	FetchPullStatus(logger logging.SimpleLogging, pull models.PullRequest) (models.PullReqStatus, error)
 }
 
 type pullReqStatusFetcher struct {
-	client Client
+	client               Client
+	vcsStatusName        string
+	ignoreVCSStatusNames []string
 }
 
-func NewPullReqStatusFetcher(client Client) PullReqStatusFetcher {
+func NewPullReqStatusFetcher(client Client, vcsStatusName string, ignoreVCSStatusNames []string) PullReqStatusFetcher {
 	return &pullReqStatusFetcher{
-		client: client,
+		client:               client,
+		vcsStatusName:        vcsStatusName,
+		ignoreVCSStatusNames: ignoreVCSStatusNames,
 	}
 }
 
-func (f *pullReqStatusFetcher) FetchPullStatus(repo models.Repo, pull models.PullRequest, vcsstatusname string) (pullStatus models.PullReqStatus, err error) {
-	approvalStatus, err := f.client.PullIsApproved(repo, pull)
+func (f *pullReqStatusFetcher) FetchPullStatus(logger logging.SimpleLogging, pull models.PullRequest) (pullStatus models.PullReqStatus, err error) {
+	approvalStatus, err := f.client.PullIsApproved(logger, pull.BaseRepo, pull)
 	if err != nil {
-		return pullStatus, errors.Wrapf(err, "fetching pull approval status for repo: %s, and pull number: %d", repo.FullName, pull.Num)
+		return pullStatus, fmt.Errorf("fetching pull approval status for repo: %s, and pull number: %d: %w", pull.BaseRepo.FullName, pull.Num, err)
 	}
 
-	mergeable, err := f.client.PullIsMergeable(repo, pull, vcsstatusname)
+	mergeable, err := f.client.PullIsMergeable(logger, pull.BaseRepo, pull, f.vcsStatusName, f.ignoreVCSStatusNames)
 	if err != nil {
-		return pullStatus, errors.Wrapf(err, "fetching mergeability status for repo: %s, and pull number: %d", repo.FullName, pull.Num)
+		return pullStatus, fmt.Errorf("fetching mergeability status for repo: %s, and pull number: %d: %w", pull.BaseRepo.FullName, pull.Num, err)
 	}
 
 	return models.PullReqStatus{
-		ApprovalStatus: approvalStatus,
-		Mergeable:      mergeable,
+		ApprovalStatus:  approvalStatus,
+		MergeableStatus: mergeable,
 	}, err
 }

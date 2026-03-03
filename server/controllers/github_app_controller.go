@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package controllers
 
 import (
@@ -6,17 +9,17 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/runatlantis/atlantis/server/controllers/templates"
-	"github.com/runatlantis/atlantis/server/events/vcs"
+	"github.com/runatlantis/atlantis/server/controllers/web_templates"
+	"github.com/runatlantis/atlantis/server/events/vcs/github"
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
 // GithubAppController handles the creation and setup of a new GitHub app
 type GithubAppController struct {
-	AtlantisURL         *url.URL
-	Logger              logging.SimpleLogging
+	AtlantisURL         *url.URL              `validate:"required"`
+	Logger              logging.SimpleLogging `validate:"required"`
 	GithubSetupComplete bool
-	GithubHostname      string
+	GithubHostname      string `validate:"required"`
 	GithubOrg           string
 }
 
@@ -54,14 +57,16 @@ func (g *GithubAppController) ExchangeCode(w http.ResponseWriter, r *http.Reques
 	}
 
 	g.Logger.Debug("Exchanging GitHub app code for app credentials")
-	creds := &vcs.GithubAnonymousCredentials{}
-	client, err := vcs.NewGithubClient(g.GithubHostname, creds, g.Logger)
+	creds := &github.AnonymousCredentials{}
+	config := github.Config{}
+	// This client does not post comments, so we don't need to configure it with maxCommentsPerCommand.
+	client, err := github.New(g.GithubHostname, creds, config, 0, g.Logger)
 	if err != nil {
 		g.respond(w, logging.Error, http.StatusInternalServerError, "Failed to exchange code for github app: %s", err)
 		return
 	}
 
-	app, err := client.ExchangeCode(code)
+	app, err := client.ExchangeCode(g.Logger, code)
 	if err != nil {
 		g.respond(w, logging.Error, http.StatusInternalServerError, "Failed to exchange code for github app: %s", err)
 		return
@@ -69,7 +74,7 @@ func (g *GithubAppController) ExchangeCode(w http.ResponseWriter, r *http.Reques
 
 	g.Logger.Debug("Found credentials for GitHub app %q with id %d", app.Name, app.ID)
 
-	err = templates.GithubAppSetupTemplate.Execute(w, templates.GithubSetupData{
+	err = web_templates.GithubAppSetupTemplate.Execute(w, web_templates.GithubSetupData{
 		Target:          "",
 		Manifest:        "",
 		ID:              app.ID,
@@ -84,7 +89,7 @@ func (g *GithubAppController) ExchangeCode(w http.ResponseWriter, r *http.Reques
 }
 
 // New redirects the user to create a new GitHub app
-func (g *GithubAppController) New(w http.ResponseWriter, r *http.Request) {
+func (g *GithubAppController) New(w http.ResponseWriter, _ *http.Request) {
 
 	if g.GithubSetupComplete {
 		g.respond(w, logging.Error, http.StatusBadRequest, "Atlantis already has GitHub credentials")
@@ -120,6 +125,8 @@ func (g *GithubAppController) New(w http.ResponseWriter, r *http.Request) {
 			"repository_hooks": "write",
 			"statuses":         "write",
 			"administration":   "read",
+			"members":          "read",
+			"actions":          "read",
 		},
 	}
 
@@ -140,7 +147,7 @@ func (g *GithubAppController) New(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = templates.GithubAppSetupTemplate.Execute(w, templates.GithubSetupData{
+	err = web_templates.GithubAppSetupTemplate.Execute(w, web_templates.GithubSetupData{
 		Target:   url.String(),
 		Manifest: string(jsonManifest),
 	})
@@ -149,7 +156,7 @@ func (g *GithubAppController) New(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (g *GithubAppController) respond(w http.ResponseWriter, lvl logging.LogLevel, code int, format string, args ...interface{}) {
+func (g *GithubAppController) respond(w http.ResponseWriter, lvl logging.LogLevel, code int, format string, args ...any) {
 	response := fmt.Sprintf(format, args...)
 	g.Logger.Log(lvl, response)
 	w.WriteHeader(code)

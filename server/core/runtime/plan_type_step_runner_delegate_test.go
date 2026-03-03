@@ -1,3 +1,6 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package runtime
 
 import (
@@ -7,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/go-version"
-	. "github.com/petergtz/pegomock"
+	. "github.com/petergtz/pegomock/v4"
 	. "github.com/runatlantis/atlantis/testing"
 
 	"github.com/runatlantis/atlantis/server/core/runtime/mocks"
@@ -33,7 +36,7 @@ func TestRunDelegate(t *testing.T) {
 	mockDefaultRunner := mocks.NewMockRunner()
 	mockRemoteRunner := mocks.NewMockRunner()
 
-	subject := &PlanTypeStepRunnerDelegate{
+	subject := &planTypeStepRunnerDelegate{
 		defaultRunner:    mockDefaultRunner,
 		remotePlanRunner: mockRemoteRunner,
 	}
@@ -41,8 +44,7 @@ func TestRunDelegate(t *testing.T) {
 	tfVersion, _ := version.NewVersion("0.12.0")
 
 	t.Run("Remote Runner Success", func(t *testing.T) {
-		tmpDir, cleanup := TempDir(t)
-		defer cleanup()
+		tmpDir := t.TempDir()
 		planPath := filepath.Join(tmpDir, "workspace.tfplan")
 		err := os.WriteFile(planPath, []byte("Atlantis: this plan was created by remote ops\n"+planFileContents), 0600)
 		Ok(t, err)
@@ -70,8 +72,7 @@ func TestRunDelegate(t *testing.T) {
 	})
 
 	t.Run("Remote Runner Failure", func(t *testing.T) {
-		tmpDir, cleanup := TempDir(t)
-		defer cleanup()
+		tmpDir := t.TempDir()
 		planPath := filepath.Join(tmpDir, "workspace.tfplan")
 		err := os.WriteFile(planPath, []byte("Atlantis: this plan was created by remote ops\n"+planFileContents), 0600)
 		Ok(t, err)
@@ -99,8 +100,7 @@ func TestRunDelegate(t *testing.T) {
 	})
 
 	t.Run("Local Runner Success", func(t *testing.T) {
-		tmpDir, cleanup := TempDir(t)
-		defer cleanup()
+		tmpDir := t.TempDir()
 		planPath := filepath.Join(tmpDir, "workspace.tfplan")
 		err := os.WriteFile(planPath, []byte(planFileContents), 0600)
 		Ok(t, err)
@@ -128,8 +128,7 @@ func TestRunDelegate(t *testing.T) {
 	})
 
 	t.Run("Local Runner Failure", func(t *testing.T) {
-		tmpDir, cleanup := TempDir(t)
-		defer cleanup()
+		tmpDir := t.TempDir()
 		planPath := filepath.Join(tmpDir, "workspace.tfplan")
 		err := os.WriteFile(planPath, []byte(planFileContents), 0600)
 		Ok(t, err)
@@ -139,6 +138,151 @@ func TestRunDelegate(t *testing.T) {
 			RepoRelDir:         ".",
 			EscapedCommentArgs: []string{"comment", "args"},
 			TerraformVersion:   tfVersion,
+		}
+		extraArgs := []string{"extra", "args"}
+		envs := map[string]string{}
+
+		expectedOut := "some random output"
+
+		When(mockDefaultRunner.Run(ctx, extraArgs, tmpDir, envs)).ThenReturn(expectedOut, errors.New("err"))
+
+		output, err := subject.Run(ctx, extraArgs, tmpDir, envs)
+
+		mockRemoteRunner.VerifyWasCalled(Never())
+
+		Equals(t, expectedOut, output)
+		Assert(t, err != nil, "err should not be nil")
+
+	})
+
+}
+
+var openTofuPlanFileContents = `
+An execution plan has been generated and is shown below.
+Resource actions are indicated with the following symbols:
+  - destroy
+
+OpenTofu will perform the following actions:
+
+  - null_resource.hi[1]
+
+
+Plan: 0 to add, 0 to change, 1 to destroy.`
+
+func TestRunDelegate_UsesConfiguredDistribution(t *testing.T) {
+
+	RegisterMockTestingT(t)
+
+	mockDefaultRunner := mocks.NewMockRunner()
+	mockRemoteRunner := mocks.NewMockRunner()
+
+	subject := &planTypeStepRunnerDelegate{
+		defaultRunner:    mockDefaultRunner,
+		remotePlanRunner: mockRemoteRunner,
+	}
+
+	tfDistribution := "opentofu"
+	tfVersion, _ := version.NewVersion("1.7.0")
+
+	t.Run("Remote Runner Success", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		planPath := filepath.Join(tmpDir, "workspace.tfplan")
+		err := os.WriteFile(planPath, []byte("Atlantis: this plan was created by remote ops\n"+openTofuPlanFileContents), 0600)
+		Ok(t, err)
+
+		ctx := command.ProjectContext{
+			Workspace:             "workspace",
+			RepoRelDir:            ".",
+			EscapedCommentArgs:    []string{"comment", "args"},
+			TerraformDistribution: &tfDistribution,
+			TerraformVersion:      tfVersion,
+		}
+		extraArgs := []string{"extra", "args"}
+		envs := map[string]string{}
+
+		expectedOut := "some random output"
+
+		When(mockRemoteRunner.Run(ctx, extraArgs, tmpDir, envs)).ThenReturn(expectedOut, nil)
+
+		output, err := subject.Run(ctx, extraArgs, tmpDir, envs)
+
+		mockDefaultRunner.VerifyWasCalled(Never())
+
+		Equals(t, expectedOut, output)
+		Ok(t, err)
+
+	})
+
+	t.Run("Remote Runner Failure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		planPath := filepath.Join(tmpDir, "workspace.tfplan")
+		err := os.WriteFile(planPath, []byte("Atlantis: this plan was created by remote ops\n"+openTofuPlanFileContents), 0600)
+		Ok(t, err)
+
+		ctx := command.ProjectContext{
+			Workspace:             "workspace",
+			RepoRelDir:            ".",
+			EscapedCommentArgs:    []string{"comment", "args"},
+			TerraformDistribution: &tfDistribution,
+			TerraformVersion:      tfVersion,
+		}
+		extraArgs := []string{"extra", "args"}
+		envs := map[string]string{}
+
+		expectedOut := "some random output"
+
+		When(mockRemoteRunner.Run(ctx, extraArgs, tmpDir, envs)).ThenReturn(expectedOut, errors.New("err"))
+
+		output, err := subject.Run(ctx, extraArgs, tmpDir, envs)
+
+		mockDefaultRunner.VerifyWasCalled(Never())
+
+		Equals(t, expectedOut, output)
+		Assert(t, err != nil, "err should not be nil")
+
+	})
+
+	t.Run("Local Runner Success", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		planPath := filepath.Join(tmpDir, "workspace.tfplan")
+		err := os.WriteFile(planPath, []byte(openTofuPlanFileContents), 0600)
+		Ok(t, err)
+
+		ctx := command.ProjectContext{
+			Workspace:             "workspace",
+			RepoRelDir:            ".",
+			EscapedCommentArgs:    []string{"comment", "args"},
+			TerraformDistribution: &tfDistribution,
+			TerraformVersion:      tfVersion,
+		}
+		extraArgs := []string{"extra", "args"}
+		envs := map[string]string{}
+
+		expectedOut := "some random output"
+
+		When(mockDefaultRunner.Run(ctx, extraArgs, tmpDir, envs)).ThenReturn(expectedOut, nil)
+
+		output, err := subject.Run(ctx, extraArgs, tmpDir, envs)
+
+		mockRemoteRunner.VerifyWasCalled(Never())
+
+		Equals(t, expectedOut, output)
+		Ok(t, err)
+
+	})
+
+	t.Run("Local Runner Failure", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		planPath := filepath.Join(tmpDir, "workspace.tfplan")
+		err := os.WriteFile(planPath, []byte(openTofuPlanFileContents), 0600)
+		Ok(t, err)
+
+		ctx := command.ProjectContext{
+			Workspace:             "workspace",
+			RepoRelDir:            ".",
+			EscapedCommentArgs:    []string{"comment", "args"},
+			TerraformDistribution: &tfDistribution,
+			TerraformVersion:      tfVersion,
 		}
 		extraArgs := []string{"extra", "args"}
 		envs := map[string]string{}

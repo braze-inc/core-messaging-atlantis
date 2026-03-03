@@ -1,41 +1,54 @@
+// Copyright 2025 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package controllers
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 	"github.com/runatlantis/atlantis/server/logging"
-	"github.com/uber-go/tally"
-	"gopkg.in/go-playground/validator.v9"
+	tally "github.com/uber-go/tally/v4"
 )
 
 const atlantisTokenHeader = "X-Atlantis-Token"
 
 type APIController struct {
-	APISecret                 []byte
-	Locker                    locking.Locker
-	Logger                    logging.SimpleLogging
-	Parser                    events.EventParsing
-	ProjectCommandBuilder     events.ProjectCommandBuilder
-	ProjectPlanCommandRunner  events.ProjectPlanCommandRunner
-	ProjectApplyCommandRunner events.ProjectApplyCommandRunner
-	RepoAllowlistChecker      *events.RepoAllowlistChecker
-	Scope                     tally.Scope
-	VCSClient                 vcs.Client
+	APISecret                      []byte
+	Locker                         locking.Locker                   `validate:"required"`
+	Logger                         logging.SimpleLogging            `validate:"required"`
+	Parser                         events.EventParsing              `validate:"required"`
+	ProjectCommandBuilder          events.ProjectCommandBuilder     `validate:"required"`
+	ProjectPlanCommandRunner       events.ProjectPlanCommandRunner  `validate:"required"`
+	ProjectApplyCommandRunner      events.ProjectApplyCommandRunner `validate:"required"`
+	FailOnPreWorkflowHookError     bool
+	PreWorkflowHooksCommandRunner  events.PreWorkflowHooksCommandRunner  `validate:"required"`
+	PostWorkflowHooksCommandRunner events.PostWorkflowHooksCommandRunner `validate:"required"`
+	RepoAllowlistChecker           *events.RepoAllowlistChecker          `validate:"required"`
+	Scope                          tally.Scope                           `validate:"required"`
+	VCSClient                      vcs.Client                            `validate:"required"`
+	WorkingDir                     events.WorkingDir                     `validate:"required"`
+	WorkingDirLocker               events.WorkingDirLocker               `validate:"required"`
+	CommitStatusUpdater            events.CommitStatusUpdater            `validate:"required"`
+	// SilenceVCSStatusNoProjects is whether API should set commit status if no projects are found
+	SilenceVCSStatusNoProjects bool
 }
 
 type APIRequest struct {
 	Repository string `validate:"required"`
 	Ref        string `validate:"required"`
 	Type       string `validate:"required"`
+	PR         int
 	Projects   []string
 	Paths      []struct {
 		Directory string
@@ -43,16 +56,18 @@ type APIRequest struct {
 	}
 }
 
-func (a *APIRequest) getCommands(ctx *command.Context, cmdBuilder func(*command.Context, *events.CommentCommand) ([]command.ProjectContext, error)) ([]command.ProjectContext, error) {
+func (a *APIRequest) getCommands(ctx *command.Context, cmdName command.Name, cmdBuilder func(*command.Context, *events.CommentCommand) ([]command.ProjectContext, error)) ([]command.ProjectContext, []*events.CommentCommand, error) {
 	cc := make([]*events.CommentCommand, 0)
 
 	for _, project := range a.Projects {
 		cc = append(cc, &events.CommentCommand{
+			Name:        cmdName,
 			ProjectName: project,
 		})
 	}
 	for _, path := range a.Paths {
 		cc = append(cc, &events.CommentCommand{
+			Name:       cmdName,
 			RepoRelDir: strings.TrimRight(path.Directory, "/"),
 			Workspace:  path.Workspace,
 		})
@@ -62,19 +77,19 @@ func (a *APIRequest) getCommands(ctx *command.Context, cmdBuilder func(*command.
 	for _, commentCommand := range cc {
 		projectCmds, err := cmdBuilder(ctx, commentCommand)
 		if err != nil {
-			return nil, fmt.Errorf("failed to build command: %v", err)
+			return nil, nil, fmt.Errorf("failed to build command: %v", err)
 		}
 		cmds = append(cmds, projectCmds...)
 	}
 
-	return cmds, nil
+	return cmds, cc, nil
 }
 
 func (a *APIController) apiReportError(w http.ResponseWriter, code int, err error) {
 	response, _ := json.Marshal(map[string]string{
 		"error": err.Error(),
 	})
-	a.respond(w, logging.Warn, code, string(response))
+	a.respond(w, logging.Warn, code, "%s", string(response))
 }
 
 func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
@@ -86,12 +101,18 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err = a.apiSetup(ctx, command.Plan)
+	if err != nil {
+		a.apiReportError(w, http.StatusInternalServerError, err)
+		return
+	}
+
 	result, err := a.apiPlan(request, ctx)
 	if err != nil {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, 0) // nolint: errcheck
+	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
 	if result.HasErrors() {
 		code = http.StatusInternalServerError
 	}
@@ -102,7 +123,7 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
-	a.respond(w, logging.Debug, code, string(response))
+	a.respond(w, logging.Warn, code, "%s", string(response))
 }
 
 func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
@@ -114,13 +135,19 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err = a.apiSetup(ctx, command.Apply)
+	if err != nil {
+		a.apiReportError(w, http.StatusInternalServerError, err)
+		return
+	}
+
 	// We must first make the plan for all projects
 	_, err = a.apiPlan(request, ctx)
 	if err != nil {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, 0) // nolint: errcheck
+	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
 
 	// We can now prepare and run the apply step
 	result, err := a.apiApply(request, ctx)
@@ -137,33 +164,171 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
-	a.respond(w, logging.Debug, code, string(response))
+	a.respond(w, logging.Warn, code, "%s", string(response))
+}
+
+type LockDetail struct {
+	Name            string
+	ProjectName     string
+	ProjectRepo     string
+	ProjectRepoPath string
+	PullID          int `json:",string"`
+	PullURL         string
+	User            string
+	Workspace       string
+	Time            time.Time
+}
+
+type ListLocksResult struct {
+	Locks []LockDetail
+}
+
+func (a *APIController) ListLocks(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	locks, err := a.Locker.List()
+	if err != nil {
+		a.apiReportError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	result := ListLocksResult{}
+	for name, lock := range locks {
+		lockDetail := LockDetail{
+			name,
+			lock.Project.ProjectName,
+			lock.Project.RepoFullName,
+			lock.Project.Path,
+			lock.Pull.Num,
+			lock.Pull.URL,
+			lock.User.Username,
+			lock.Workspace,
+			lock.Time,
+		}
+		result.Locks = append(result.Locks, lockDetail)
+	}
+
+	response, err := json.Marshal(result)
+	if err != nil {
+		a.apiReportError(w, http.StatusInternalServerError, err)
+		return
+	}
+	a.respond(w, logging.Warn, http.StatusOK, "%s", string(response))
+}
+
+func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) error {
+	pull := ctx.Pull
+	baseRepo := ctx.Pull.BaseRepo
+	headRepo := ctx.HeadRepo
+
+	unlockFn, err := a.WorkingDirLocker.TryLock(baseRepo.FullName, pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName)
+	if err != nil {
+		return err
+	}
+	ctx.Log.Debug("got workspace lock")
+	defer unlockFn()
+
+	// ensure workingDir is present
+	_, err = a.WorkingDir.Clone(ctx.Log, headRepo, pull, events.DefaultWorkspace)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (a *APIController) apiPlan(request *APIRequest, ctx *command.Context) (*command.Result, error) {
-	cmds, err := request.getCommands(ctx, a.ProjectCommandBuilder.BuildPlanCommands)
+	cmds, cc, err := request.getCommands(ctx, command.Plan, a.ProjectCommandBuilder.BuildPlanCommands)
 	if err != nil {
 		return nil, err
 	}
 
+	if len(cmds) == 0 {
+		ctx.Log.Info("determined there was no project to run plan in")
+		// When silence is enabled and no projects are found, don't set any VCS status
+		if !a.SilenceVCSStatusNoProjects {
+			ctx.Log.Debug("setting VCS status to success with no projects found")
+			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.Plan, 0, 0); err != nil {
+				ctx.Log.Warn("unable to update plan status: %s", err)
+			}
+			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.PolicyCheck, 0, 0); err != nil {
+				ctx.Log.Warn("unable to update policy check status: %s", err)
+			}
+			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.Apply, 0, 0); err != nil {
+				ctx.Log.Warn("unable to update apply status: %s", err)
+			}
+		} else {
+			ctx.Log.Debug("silence enabled and no projects found - not setting any VCS status")
+		}
+		return &command.Result{ProjectResults: []command.ProjectResult{}}, nil
+	}
+
+	// Update the combined plan commit status to pending
+	if err := a.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.PendingCommitStatus, command.Plan); err != nil {
+		ctx.Log.Warn("unable to update plan commit status: %s", err)
+	}
+
 	var projectResults []command.ProjectResult
-	for _, cmd := range cmds {
-		res := a.ProjectPlanCommandRunner.Plan(cmd)
+	for i, cmd := range cmds {
+		err = a.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cc[i])
+		if err != nil {
+			if a.FailOnPreWorkflowHookError {
+				return nil, err
+			}
+		}
+
+		res := events.RunOneProjectCmd(a.ProjectPlanCommandRunner.Plan, cmd)
 		projectResults = append(projectResults, res)
+
+		a.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cc[i]) // nolint: errcheck
 	}
 	return &command.Result{ProjectResults: projectResults}, nil
 }
 
 func (a *APIController) apiApply(request *APIRequest, ctx *command.Context) (*command.Result, error) {
-	cmds, err := request.getCommands(ctx, a.ProjectCommandBuilder.BuildApplyCommands)
+	cmds, cc, err := request.getCommands(ctx, command.Apply, a.ProjectCommandBuilder.BuildApplyCommands)
 	if err != nil {
 		return nil, err
 	}
 
+	if len(cmds) == 0 {
+		ctx.Log.Info("determined there was no project to run apply in")
+		// When silence is enabled and no projects are found, don't set any VCS status
+		if !a.SilenceVCSStatusNoProjects {
+			ctx.Log.Debug("setting VCS status to success with no projects found")
+			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.Plan, 0, 0); err != nil {
+				ctx.Log.Warn("unable to update plan status: %s", err)
+			}
+			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.PolicyCheck, 0, 0); err != nil {
+				ctx.Log.Warn("unable to update policy check status: %s", err)
+			}
+			if err := a.CommitStatusUpdater.UpdateCombinedCount(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.SuccessCommitStatus, command.Apply, 0, 0); err != nil {
+				ctx.Log.Warn("unable to update apply status: %s", err)
+			}
+		} else {
+			ctx.Log.Debug("silence enabled and no projects found - not setting any VCS status")
+		}
+		return &command.Result{ProjectResults: []command.ProjectResult{}}, nil
+	}
+
+	// Update the combined apply commit status to pending
+	if err := a.CommitStatusUpdater.UpdateCombined(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull, models.PendingCommitStatus, command.Apply); err != nil {
+		ctx.Log.Warn("unable to update apply commit status: %s", err)
+	}
+
 	var projectResults []command.ProjectResult
-	for _, cmd := range cmds {
-		res := a.ProjectApplyCommandRunner.Apply(cmd)
+	for i, cmd := range cmds {
+		err = a.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cc[i])
+		if err != nil {
+			if a.FailOnPreWorkflowHookError {
+				return nil, err
+			}
+		}
+
+		res := events.RunOneProjectCmd(a.ProjectApplyCommandRunner.Apply, cmd)
 		projectResults = append(projectResults, res)
+
+		a.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cc[i]) // nolint: errcheck
 	}
 	return &command.Result{ProjectResults: projectResults}, nil
 }
@@ -180,7 +345,7 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 	}
 
 	// Parse the JSON payload
-	bytes, err := ioutil.ReadAll(r.Body)
+	bytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, nil, http.StatusBadRequest, fmt.Errorf("failed to read request")
 	}
@@ -196,7 +361,7 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 	if err != nil {
 		return nil, nil, http.StatusBadRequest, err
 	}
-	cloneURL, err := a.VCSClient.GetCloneURL(VCSHostType, request.Repository)
+	cloneURL, err := a.VCSClient.GetCloneURL(a.Logger, VCSHostType, request.Repository)
 	if err != nil {
 		return nil, nil, http.StatusInternalServerError, err
 	}
@@ -214,7 +379,7 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 	return &request, &command.Context{
 		HeadRepo: baseRepo,
 		Pull: models.PullRequest{
-			Num:        0,
+			Num:        request.PR,
 			BaseBranch: request.Ref,
 			HeadBranch: request.Ref,
 			HeadCommit: request.Ref,
@@ -222,10 +387,11 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 		},
 		Scope: a.Scope,
 		Log:   a.Logger,
+		API:   true,
 	}, http.StatusOK, nil
 }
 
-func (a *APIController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...interface{}) {
+func (a *APIController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...any) {
 	response := fmt.Sprintf(format, args...)
 	a.Logger.Log(lvl, response)
 	w.WriteHeader(responseCode)
